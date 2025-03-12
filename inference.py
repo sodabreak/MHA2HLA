@@ -4,12 +4,12 @@ import torch
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # model name
-model_name = "AICrossSim/clm-200m"
+model_name = "AICrossSim/clm-60m"
 tokenizer_name = "HuggingFaceTB/cosmo2-tokenizer"
 
 # 加载 Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-model = AutoModelForCausalLM.from_pretrained( "weights/clm-200m",  ignore_mismatched_sizes=True, torch_dtype=torch.float16).to(device)
+model = AutoModelForCausalLM.from_pretrained(model_name,  ignore_mismatched_sizes=True, torch_dtype=torch.float16).to(device)
 
 # text_generator = pipeline("text-generation", model="AICrossSim/clm-200m")
 
