@@ -50,7 +50,6 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-# 检查是否支持 torch_flex_attn
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import BlockMask
     from transformers.integrations.flex_attention import make_flex_block_causal_mask
@@ -270,14 +269,14 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
+        input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
+        hidden_shape = (*input_shape, -1, self.head_dim) # (1, 5, -1, 64)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
 
-        cos, sin = position_embeddings
+        cos, sin = position_embeddings # ([1, 5, 64], [1, 5, 64])
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
@@ -334,7 +333,7 @@ class LlamaDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        residual = hidden_states
+        residual = hidden_states # torch.Size([1, 5, 384])
 
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -571,10 +570,10 @@ class LlamaModel(LlamaPreTrainedModel):
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
 
-        hidden_states = inputs_embeds
+        hidden_states = inputs_embeds #torch.Size([1, 5, 384])
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids) # (torch.Size([1, 5, 64]), torch.Size([1, 5, 64]))
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -768,8 +767,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = LlamaModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.vocab_size = config.vocab_size # 49152
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) # 384, 49152
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -884,10 +883,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
-
-
-
-
 # __all__ = [
 #     "LlamaForCausalLM",
 #     "LlamaModel",
@@ -898,6 +893,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 # ]
 
 if __name__ == '__main__':
+
+
     from transformers import  AutoTokenizer
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # model name
@@ -910,6 +907,7 @@ if __name__ == '__main__':
         tokenizer.pad_token = tokenizer.eos_token 
     
     model = LlamaForCausalLM.from_pretrained(model_name,  ignore_mismatched_sizes=True, torch_dtype=torch.float16).to(device)
+
     input_text = "The future of AI is"
     # input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
     inputs = tokenizer(
@@ -930,7 +928,7 @@ if __name__ == '__main__':
         top_k=50, 
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id = tokenizer.pad_token_id
-    )
+    ) # torch.Size([1, 50])
 
     decoded_text = tokenizer.decode(output[0], skip_special_tokens=True)
     print(decoded_text)
