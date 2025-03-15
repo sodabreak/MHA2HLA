@@ -1,52 +1,72 @@
 import os
 import torch
-from transformers import LlamaForCausalLM, AutoTokenizer, TrainingArguments, Trainer
-from datasets import load_dataset
-import google.protobuf
-print(f"CUDA Available: {torch.cuda.is_available()}")
-print(f"CUDA Device Count: {torch.cuda.device_count()}")
-print(f"Current CUDA Device: {torch.cuda.current_device()}" if torch.cuda.is_available() else "No GPU detected")
-print(f"GPU Name: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "No GPU detected")
+import argparse
+from transformers import LlamaForCausalLM, AutoTokenizer
+from datasets import load_dataset, DatasetDict , load_from_disk
+from transformers import TrainingArguments, Trainer
+
+# ✅ 1. **解析命令行参数**
+parser = argparse.ArgumentParser(description="Load and fine-tune LLaMA model.")
+parser.add_argument("--model_dir", type=str, required=True, help="Path to the model directory.")
+parser.add_argument("--model_name", type=str, default="AICrossSim/clm-60m", help="Hugging Face model name.")
+args = parser.parse_args()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"🚀 Using device: {device}")
 
-# ✅ 0. **避免 protobuf 依赖问题**
-#os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+# ✅ 2. **定义路径**
+model_dir = args.model_dir
+model_name = args.model_name
+dataset_path = os.path.join(model_dir, "wikitext-2-v1")  # ✅ 数据集目录
+model_path = os.path.join(model_dir, "model.safetensors")
+tokenizer_path = os.path.join(model_dir, "tokenizer.json")
 
-# ✅ 1. **确保模型权重和 tokenizer 存在**
-model_dir = "E:/MHA2HLA/clm-60m-finetuned"
-model_name = "AICrossSim/clm-60m"
-
-if not os.path.exists(model_dir):
-    print("🔍 Model not found locally. Downloading from Hugging Face...")
-    model = LlamaForCausalLM.from_pretrained(model_name)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+# ✅ 3. **确保模型权重存在**
+if not os.path.exists(model_path):
+    print(f"🔍 Model not found locally in {model_dir}. Downloading from Hugging Face...")
+    model = LlamaForCausalLM.from_pretrained(model_name).to(device)
     os.makedirs(model_dir, exist_ok=True)
-    model.save_pretrained(model_dir)
+    model.save_pretrained(model_dir, safe_serialization=True)
+else:
+    print(f"✅ Model found locally in {model_dir}. Loading...")
+    model = LlamaForCausalLM.from_pretrained(model_dir).to(device)
+
+# ✅ 4. **确保 Tokenizer 存在**
+if not os.path.exists(tokenizer_path):
+    print(f"🔍 Tokenizer not found locally in {model_dir}. Downloading from Hugging Face...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.save_pretrained(model_dir)
 else:
-    print("✅ Model found locally. Loading...")
-    model = LlamaForCausalLM.from_pretrained(model_dir)
+    print(f"✅ Tokenizer found locally in {model_dir}. Loading...")
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
 
-# **确保 Tokenizer 有 `pad_token`**
+# ✅ 5. **确保 Tokenizer 有 `pad_token`**
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-# ✅ 2. **加载 Parquet 数据**
-dataset_path = "E:/MHA2HLA/clm-60m-finetuned/wikitext-2-v1"
+# ✅ 6. **检查数据集是否存在**
+expected_splits = ["train", "validation", "test"]
+if all(os.path.exists(os.path.join(dataset_path, split)) for split in expected_splits):
+    print(f"📂 发现本地数据集 {dataset_path}，正在加载...")
+    dataset = DatasetDict({
+        "train": load_from_disk(os.path.join(dataset_path, "train")),
+        "validation": load_from_disk(os.path.join(dataset_path, "validation")),
+        "test": load_from_disk(os.path.join(dataset_path, "test"))
+    })
+else:
+    print("🔍 数据集不存在，正在从 Hugging Face 下载 `wikitext-2-v1`...")
+    dataset = load_dataset("wikitext", "wikitext-2-v1")
 
-dataset = load_dataset("parquet", data_files={
-    "train": f"{dataset_path}/train-00000-of-00001.parquet",
-    "validation": f"{dataset_path}/validation-00000-of-00001.parquet",
-    "test": f"{dataset_path}/test-00000-of-00001.parquet",
-})
+    # ✅ **将数据集保存到本地**
+    dataset.save_to_disk(dataset_path)
+    print(f"✅ 数据集已下载并保存至 {dataset_path}")
 
-print("📂 数据集信息:", dataset)
+print(f"📂 数据集加载成功：{dataset}")
+
+print("🚀 Model, Tokenizer, and Dataset are ready!")
+
 
 # **查看数据结构**
-print("🔎 样本数据:", dataset["train"][0])
+print("样本数据:", dataset["train"][:5])  # 打印前 5 条
 
 # ✅ 3. **Tokenization**
 def tokenize_function(examples):
@@ -89,8 +109,8 @@ trainer.train()
 model.save_pretrained(model_dir)
 tokenizer.save_pretrained(model_dir)
 print("✅ 模型已保存至:", model_dir)
-'''
-# ✅ 7. **评估**
+
+
 try:
     from lm_eval.evaluator import simple_evaluate
 
@@ -102,10 +122,6 @@ try:
     print("📊 Evaluation Results:", results)
 except Exception as e:
     print(f"❌ 评估失败: {e}")
-'''
-# ✅ 8. **上传 Hugging Face（可选）**
-upload_to_hf = False  # 如果需要上传，改成 True
-if upload_to_hf:
-    os.system(f"huggingface-cli upload {model_dir} --repo AICrossSim/clm-60m-finetuned")
+
 
 print("🎉 训练完成！🚀")
