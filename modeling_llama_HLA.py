@@ -50,9 +50,9 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-if is_torch_flex_attn_available():
-    from torch.nn.attention.flex_attention import BlockMask
-    from transformers.integrations.flex_attention import make_flex_block_causal_mask
+# if is_torch_flex_attn_available():
+#     from torch.nn.attention.flex_attention import BlockMask
+#     from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 
 
@@ -272,6 +272,8 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
         hidden_shape = (*input_shape, -1, self.head_dim) # (1, 5, -1, 64)
 
+
+        """ change 1: 分解proj矩阵 """    
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
