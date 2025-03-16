@@ -50,9 +50,9 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-# if is_torch_flex_attn_available():
-#     from torch.nn.attention.flex_attention import BlockMask
-#     from transformers.integrations.flex_attention import make_flex_block_causal_mask
+if is_torch_flex_attn_available():
+    from torch.nn.attention.flex_attention import BlockMask
+    from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 
 

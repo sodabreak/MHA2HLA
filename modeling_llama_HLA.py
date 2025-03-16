@@ -475,9 +475,10 @@ class LlamaAttention(nn.Module):
         attention_mask: Optional[torch.Tensor],
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        training: bool = True,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if torch.all(self.k_u_proj.weight == 0): 
+        if torch.all(self.k_u_proj.weight == 0) and training: 
             self.get_up_down_matrix()
 
         input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
@@ -549,6 +550,7 @@ class LlamaDecoderLayer(nn.Module):
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        training: bool = True,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states # torch.Size([1, 5, 384])
@@ -565,6 +567,7 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            training=training,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -752,6 +755,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        training: bool = True,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -825,6 +829,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    training=training,
                     **flash_attn_kwargs,
                 )
 
@@ -989,7 +994,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size # 49152
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) # 384, 49152
-
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1028,6 +1032,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
+        training: bool = True,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -1079,6 +1084,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            training=training,
             **kwargs,
         )
 
@@ -1146,7 +1152,8 @@ if __name__ == '__main__':
         temperature=0.7, 
         top_k=50, 
         eos_token_id=tokenizer.eos_token_id,
-        pad_token_id = tokenizer.pad_token_id
+        pad_token_id = tokenizer.pad_token_id,
+        training=True
     ) # torch.Size([1, 50])
 
     decoded_text = tokenizer.decode(output[0], skip_special_tokens=True)
