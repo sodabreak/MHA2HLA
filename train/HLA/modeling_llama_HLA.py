@@ -365,6 +365,7 @@ class LlamaAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.init = False
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -478,8 +479,10 @@ class LlamaAttention(nn.Module):
         training: bool = True,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if torch.all(self.k_u_proj.weight == 0) and training: 
+        # if torch.all(self.k_u_proj.weight == 0) and training: 
+        if not self.init:
             self.get_up_down_matrix()
+            self.init=True
 
         input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
         hidden_shape = (*input_shape, -1, self.head_dim // 2) # (1, 5, -1, 64)
