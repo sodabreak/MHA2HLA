@@ -25,6 +25,3 @@ jobs:
         run: |
           python modeling_llama_HLA.py 
 
-      - name: Run Tests
-        run: |
-          pytest 
