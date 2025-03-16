@@ -33,7 +33,7 @@ if not os.path.exists(model_path):
     config = LlamaConfig.from_pretrained(model_name)
 
     # 2️⃣ 使用自定义模型架构
-    model = LlamaForCausalLM(config).to(device)
+    model = LlamaForCausalLM.from_pretrained(model_name).to(device)
 
     # 3️⃣ 创建目录 & 保存模型
     os.makedirs(model_dir, exist_ok=True)
