@@ -259,15 +259,17 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
     Returns:
         `tuple(torch.Tensor)`: The transformed query and key tensors.
     """
-    batch_size, num_heads, seq_len, head_dim = q.shape  # [batch, num_heads, seq_len, 32]
+    batch_size, num_heads_q, seq_len, head_dim = q.shape  # [batch, num_heads, seq_len, 32]
+    batch_size, num_heads_k, seq_len, head_dim = k.shape  
     head_dim_half = head_dim // 2  # 32 -> 16
-    total_dim = num_heads * head_dim  # `num_heads * 32`
+    total_dim_q = num_heads_q * head_dim  # `num_heads * 32`
+    total_dim_k = num_heads_k * head_dim
 
     q_embed = torch.zeros_like(q)
     k_embed = torch.zeros_like(k)
 
-    q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim)  # [batch, seq_len, num_heads*32]
-    k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim)  # [batch, seq_len, num_heads*32]
+    q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_q)  # [batch, seq_len, num_heads*32]
+    k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_k)  # [batch, seq_len, num_heads*32]
 
     q_transformed = torch.zeros_like(q_concat)  # [batch, seq_len, num_heads*32]
     k_transformed = torch.zeros_like(k_concat)  # [batch, seq_len, num_heads*32]
@@ -279,8 +281,8 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
         B_k_2 = B_k[:2, :]  # [2, num_heads*32]
 
         # `B' * R`
-        B_q_rot = torch.matmul(B_q_2.T, rope_matrix_h)  # [seq_len, num_heads*32, 2]
-        B_k_rot = torch.matmul(B_k_2.T, rope_matrix_h)  # [seq_len, num_heads*32, 2]
+        B_q_rot = torch.matmul(B_q_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # Convert both to float16
+        B_k_rot = torch.matmul(B_k_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # 
 
         # `(B' R) B`
         B_q_transformed = torch.matmul(B_q_rot, B_q_2)  # [seq_len, num_heads*32, num_heads*32]
@@ -298,8 +300,10 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
         k_transformed += k_final
 
     # reshape `[batch, num_heads, seq_len, 32]`
-    q_embed = q_transformed.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
-    k_embed = k_transformed.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+    # q_embed = q_transformed.view(batch_size, seq_len, num_heads_q, head_dim).permute(0, 2, 1, 3)
+    # k_embed = k_transformed.view(batch_size, seq_len, num_heads_k, head_dim).permute(0, 2, 1, 3)
+    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q * head_dim)
+    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k * head_dim)
 
     return q_embed, k_embed
 
@@ -466,10 +470,8 @@ class LlamaAttention(nn.Module):
         """
         with torch.no_grad():
             W_q = self.q_u_proj.weight.float()
-
             C_q, S_q, B_q = torch.linalg.svd(W_q, full_matrices=False)
             W_k = self.k_u_proj.weight.float()
-
             C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
 
         return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
@@ -487,7 +489,7 @@ class LlamaAttention(nn.Module):
         self.get_up_down_matrix()
 
         input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
-        hidden_shape = (*input_shape, -1, self.head_dim) # (1, 5, -1, 64)
+        hidden_shape = (*input_shape, -1, self.head_dim // 2) # (1, 5, -1, 64)
 
 
         """ change 1: 分解proj矩阵 """    
@@ -508,7 +510,7 @@ class LlamaAttention(nn.Module):
 
         query_states = self.q_u_proj(query_states_h)
         key_states = self.k_u_proj(key_states_h)
-        value_states = self.v_u_proj(value_states_h)
+        value_states = self.v_u_proj(value_states_h.permute(0,2,1,3).view(*input_shape, -1))
 
         if past_key_value is not None:
             """ change: 注意这个地方的cache之后 """
