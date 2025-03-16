@@ -53,8 +53,6 @@ pybind11
 pyparsing
 pytablewriter
 python-dateutil
-pytz
-pywin32
 PyYAML
 regex
 requests
@@ -73,7 +71,7 @@ tabulate
 tcolorpy
 threadpoolctl
 tokenizers
-torch
+torch == 2.5.0
 torchaudio
 torchvision
 tqdm

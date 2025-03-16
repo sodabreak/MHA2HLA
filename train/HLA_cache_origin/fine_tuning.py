@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset, DatasetDict, load_from_disk
 from collections import defaultdict
-from modeling_llama import LlamaForCausalLM  # ✅ 从自定义 LLaMA 结构导入
-from transformers import LlamaConfig
+from modeling_llama_HLA_cache_origin import LlamaForCausalLM ,LlamaConfig # ✅ 从自定义 LLaMA 结构导入
+
 # ✅ 1. **解析命令行参数**
 parser = argparse.ArgumentParser(description="Load and fine-tune LLaMA model.")
 parser.add_argument("--model_dir", type=str, required=True, help="Path to the model directory.")
@@ -33,7 +33,7 @@ if not os.path.exists(model_path):
     config = LlamaConfig.from_pretrained(model_name)
 
     # 2️⃣ 使用自定义模型架构
-    model = LlamaForCausalLM.from_pretrained(model_name).to(device)
+    model = LlamaForCausalLM.from_pretrained(model_dir, config=config).to(device)
 
     # 3️⃣ 创建目录 & 保存模型
     os.makedirs(model_dir, exist_ok=True)

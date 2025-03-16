@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset, DatasetDict, load_from_disk
 from collections import defaultdict
-from modeling_llama import LlamaForCausalLM  # ✅ 从自定义 LLaMA 结构导入
-from transformers import LlamaConfig
+from modeling_llama import LlamaForCausalLM,LlamaConfig  # ✅ 从自定义 LLaMA 结构导入
+
 # ✅ 1. **解析命令行参数**
 parser = argparse.ArgumentParser(description="Load and fine-tune LLaMA model.")
 parser.add_argument("--model_dir", type=str, required=True, help="Path to the model directory.")
