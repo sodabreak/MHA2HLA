@@ -21,5 +21,11 @@ to be continued...
 add-test-workflow
 change PR rule
 
+## to start a PR
+git checkout -b newbranch
 
-有吗
+git add .
+
+git commit -m "pr"
+
+git push commit origin
