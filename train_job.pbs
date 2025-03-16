@@ -1,6 +1,6 @@
 #!/bin/bash
-#PBS -N llama_train
-#PBS -l select=1:ncpus=4:mem=64gb:ngpus=4
+#PBS -N llama_train 4gpu
+#PBS -l select=1:ncpus=1:mem=64gb:ngpus=2
 #PBS -l walltime=24:00:00
 #PBS -o /rds/general/user/zz4321/home/MHA2HLA/log/${PBS_JOBID}.out
 #PBS -e /rds/general/user/zz4321/home/MHA2HLA/log/${PBS_JOBID}.err
@@ -28,6 +28,6 @@ mkdir -p "$RESULTS_PATH"
 cd "$MODEL_PATH"
 
 # ✅ 5. **运行训练脚本**
-python fine_tuning.py --model_dir "$MODEL_DIR" --epochs 20 --batch_size 6 > "$LOG_PATH/result_${PBS_JOBID}.txt" 2>&1
+python fine_tuning.py --model_dir "$MODEL_DIR" --epochs 50 --batch_size 6 > "$LOG_PATH/result_${PBS_JOBID}.txt" 2>&1
 
 echo "✅ task finished at: $(date)" >> "$LOG_PATH/result_${PBS_JOBID}.txt"
