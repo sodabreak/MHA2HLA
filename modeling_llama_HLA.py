@@ -366,6 +366,9 @@ class LlamaAttention(nn.Module):
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
         self.init = False
+        self.init_B = False
+        self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
+        self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -454,6 +457,35 @@ class LlamaAttention(nn.Module):
             self.v_d_proj.weight.copy_(down_v.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
             self.v_u_proj.weight.copy_(up_v.to(self.q_proj.weight.dtype))  
 
+    @staticmethod
+    def randomized_svd(A, rank=None, n_iter=5):
+        """
+        使用随机 SVD 分解，提高计算速度：
+        - rank: 目标低秩近似的维度（默认为 X.shape[1]）
+        - n_iter: 迭代次数，控制近似精度
+        """
+        # if not isinstance(X, torch.Tensor):
+        #     raise ValueError(f"Expected a tensor, but got {type(X)}")
+        if rank is None:
+            rank = min(A.shape)  
+        Q_init = torch.randn(A.shape[0], rank, device=A.device, dtype=A.dtype)
+        Q, _ = torch.linalg.qr(Q_init)  
+        B = Q.T @ A  # 低秩投影
+        U, _, V_T = torch.linalg.svd(B, full_matrices=False)
+
+        return V_T.T  # 返回近似的 B 矩阵
+
+    def get_up_cb_matrix_fast(self):
+        """ 使用 Randomized SVD 替代标准 SVD，提高计算速度 """
+        with torch.no_grad():
+            W_q = self.q_u_proj.weight.float()
+            B_q = LlamaAttention.randomized_svd(W_q)  # 近似 B 矩阵
+            W_k = self.k_u_proj.weight.float()
+            B_k = LlamaAttention.randomized_svd(W_k)
+
+        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
+    
+
     def get_up_cb_matrix(self):
         """ input: up_matrix: [32 * config.hidden_size, 64 * config.hidden_size] [32 * 6, 64 * 6]
             output: C(U): [64 * 6, 64 * 6] 
@@ -493,8 +525,14 @@ class LlamaAttention(nn.Module):
 
         cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
 
-        B_q, B_k = self.get_up_cb_matrix()
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
+        # B_q, B_k = self.get_up_cb_matrix()
+        if not self.init_B:
+            B_q, B_k = self.get_up_cb_matrix_fast()
+            self.B_q = nn.Parameter(B_q.clone().detach())
+            self.B_k = nn.Parameter(B_k.clone().detach())
+            self.init = True
+
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, self.B_q, self.B_k)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
 
         if past_key_value is not None:
