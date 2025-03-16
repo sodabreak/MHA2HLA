@@ -145,6 +145,65 @@ class LlamaRotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
+class LlamaRotaryEmbeddingmy(nn.Module):
+    def __init__(self, config, device=None):
+        super().__init__()
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # 计算 RoPE 角度
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()  # 形状: [batch_size, seq_len, head_dim//2]
+            sin = emb.sin()  # 形状: [batch_size, seq_len, head_dim//2]
+
+        # 应用 RoPE 位置缩放
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        # 变换为旋转矩阵形式 `[seq_len, head_dim//2, 2, 2]`
+        rope_matrix = torch.zeros((cos.shape[1], cos.shape[2], 2, 2), device=cos.device, dtype=cos.dtype)
+        rope_matrix[..., 0, 0] = cos.squeeze(0)  # cos(θ)
+        rope_matrix[..., 0, 1] = -sin.squeeze(0)  # -sin(θ)
+        rope_matrix[..., 1, 0] = sin.squeeze(0)  # sin(θ)
+        rope_matrix[..., 1, 1] = cos.squeeze(0)  # cos(θ)
+
+        return rope_matrix  # [seq_len, head_dim//2, 2, 2]
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -177,6 +236,71 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     sin = sin.unsqueeze(unsqueeze_dim)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+import torch
+
+import torch
+
+def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None, unsqueeze_dim=1):
+    """
+    Applies Rotary Position Embedding to the query and key tensors with head-level adaptation.
+
+    Args:
+        q (`torch.Tensor`): The query tensor. Shape: [batch, num_heads, seq_len, 32]
+        k (`torch.Tensor`): The key tensor. Shape: [batch, num_heads, seq_len, 32]
+        cos_size_matrix (`torch.Tensor`): The RoPE matrix. Shape: [seq_len, head_dim//2, 2, 2]
+        B_q (`torch.Tensor`): The transformation matrix for q. Shape: [2, num_heads*32]
+        B_k (`torch.Tensor`): The transformation matrix for k. Shape: [2, num_heads*32]
+        position_ids (`torch.Tensor`, *optional*): Position indices (not used here)
+        unsqueeze_dim (`int`, *optional*, defaults to 1): 
+            Specifies the dimension along which to unsqueeze for broadcasting.
+    
+    Returns:
+        `tuple(torch.Tensor)`: The transformed query and key tensors.
+    """
+    batch_size, num_heads, seq_len, head_dim = q.shape  # [batch, num_heads, seq_len, 32]
+    head_dim_half = head_dim // 2  # 32 -> 16
+    total_dim = num_heads * head_dim  # `num_heads * 32`
+
+    q_embed = torch.zeros_like(q)
+    k_embed = torch.zeros_like(k)
+
+    q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim)  # [batch, seq_len, num_heads*32]
+    k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim)  # [batch, seq_len, num_heads*32]
+
+    q_transformed = torch.zeros_like(q_concat)  # [batch, seq_len, num_heads*32]
+    k_transformed = torch.zeros_like(k_concat)  # [batch, seq_len, num_heads*32]
+
+    # 遍历 head_dim_half（即 16 组偶数、奇数维度）
+    for i in range(head_dim_half):
+        rope_matrix_h = cos_size_matrix[:, i, :, :]  # [seq_len, 2, 2]
+        B_q_2 = B_q[:2, :]  # [2, num_heads*32]
+        B_k_2 = B_k[:2, :]  # [2, num_heads*32]
+
+        # `B' * R`
+        B_q_rot = torch.matmul(B_q_2.T, rope_matrix_h)  # [seq_len, num_heads*32, 2]
+        B_k_rot = torch.matmul(B_k_2.T, rope_matrix_h)  # [seq_len, num_heads*32, 2]
+
+        # `(B' R) B`
+        B_q_transformed = torch.matmul(B_q_rot, B_q_2)  # [seq_len, num_heads*32, num_heads*32]
+        B_k_transformed = torch.matmul(B_k_rot, B_k_2)  # [seq_len, num_heads*32, num_heads*32]
+
+        # 取出 q_concat, k_concat 在 `[seq_len, num_heads*32]`
+        q_h = q_concat  # [batch, seq_len, num_heads*32]
+        k_h = k_concat  # [batch, seq_len, num_heads*32]
+
+        # `q' = (B' R B) q`
+        q_final = torch.einsum("bsi,sij->bsj", q_h, B_q_transformed)  # [batch, seq_len, num_heads*32]
+        k_final = torch.einsum("bsi,sij->bsj", k_h, B_k_transformed)  # [batch, seq_len, num_heads*32]
+
+        q_transformed += q_final
+        k_transformed += k_final
+
+    # reshape `[batch, num_heads, seq_len, 32]`
+    q_embed = q_transformed.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+    k_embed = k_transformed.view(batch_size, seq_len, num_heads, head_dim).permute(0, 2, 1, 3)
+
     return q_embed, k_embed
 
 
@@ -260,6 +384,97 @@ class LlamaAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
+        # new layers
+        self.q_d_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim // 2
+        )
+        self.q_u_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim // 2, config.num_attention_heads * self.head_dim
+        )
+        self.k_d_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads  * self.head_dim // 2
+        )
+        self.k_u_proj = nn.Linear(
+            config.num_key_value_heads * self.head_dim // 2, config.num_key_value_heads * self.head_dim
+        )
+        self.v_d_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim // 2
+        )
+        self.v_u_proj = nn.Linear(
+            config.num_key_value_heads * self.head_dim // 2, config.num_key_value_heads * self.head_dim
+        )
+
+
+    def get_up_down_matrix(self):
+        """
+        对 q_proj、k_proj 分别用SVD分解，然后把分解后的矩阵拷贝到
+         q_d_proj、q_u_proj，以及 k_d_proj、k_u_proj 上。
+        """
+        with torch.no_grad():
+            W_q = self.q_proj.weight.float()  # [384, 384]
+            U_q, S_q, Vh_q = torch.linalg.svd(W_q, full_matrices=False)  # U_q: [384,384], S_q: [384], Vh_q: [384,384]
+
+            r_q = W_q.shape[0]//2
+            U_qr = U_q[:, :r_q]                # [384,192]
+            S_qr = torch.diag(S_q[:r_q])       # [192,192]
+            Vh_qr = Vh_q[:r_q, :]              # [192,384]
+
+            up_q = U_qr
+            down_q = S_qr @ Vh_qr
+
+            # 拷到 q_d_proj, q_u_proj
+            self.q_d_proj.weight.copy_(down_q.to(self.q_proj.weight.dtype))  # q_d_proj.weight -> [192,384]
+            self.q_u_proj.weight.copy_(up_q.to(self.q_proj.weight.dtype))    # q_u_proj.weight -> [384,192]
+
+            W_k = self.k_proj.weight.float()  # [128, 384]
+            U_k, S_k, Vh_k = torch.linalg.svd(W_k, full_matrices=False)  # U_k: [128,128], S_k: [128], Vh_k: [128,384]
+
+            # 取 rank=64
+            r_k = W_k.shape[0]//2
+            U_kr = U_k[:, :r_k]               # [128,64]
+            S_kr = torch.diag(S_k[:r_k])      # [64,64]
+            Vh_kr = Vh_k[:r_k, :]             # [64,384]
+
+            up_k = U_kr
+            down_k = S_kr @ Vh_kr
+
+            # 拷到 k_d_proj, k_u_proj
+            self.k_d_proj.weight.copy_(down_k.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
+            self.k_u_proj.weight.copy_(up_k.to(self.q_proj.weight.dtype))    # k_u_proj.weight -> [128,64]
+
+            W_v = self.v_proj.weight.float()  # [128, 384]
+            U_v, S_v, Vh_v = torch.linalg.svd(W_v, full_matrices=False)  # U_k: [128,128], S_k: [128], Vh_k: [128,384]
+
+            # 取 rank=64
+            r_v = W_v.shape[0]//2
+            U_vr = U_v[:, :r_v]               # [128,64]
+            S_vr = torch.diag(S_v[:r_v])      # [64,64]
+            Vh_vr = Vh_v[:r_v, :]             # [64,384]
+
+            up_v = U_vr
+            down_v = S_vr @ Vh_vr
+
+            # 拷到 k_d_proj, k_u_proj
+            self.v_d_proj.weight.copy_(down_v.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
+            self.v_u_proj.weight.copy_(up_v.to(self.q_proj.weight.dtype))  
+
+    def get_up_cb_matrix(self):
+        """ input: up_matrix: [32 * config.hidden_size, 64 * config.hidden_size] [32 * 6, 64 * 6]
+            output: C(U): [64 * 6, 64 * 6] 
+                    S(sigma): [64 * 6, 32 * 6]
+                    B(V): [32 * 6, 32 * 6]
+        """
+        with torch.no_grad():
+            W_q = self.q_u_proj.weight.float()
+
+            C_q, S_q, B_q = torch.linalg.svd(W_q, full_matrices=False)
+            W_k = self.k_u_proj.weight.float()
+
+            C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
+
+        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
+
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -269,21 +484,36 @@ class LlamaAttention(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        self.get_up_down_matrix()
+
         input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
         hidden_shape = (*input_shape, -1, self.head_dim) # (1, 5, -1, 64)
 
 
         """ change 1: 分解proj矩阵 """    
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
+        # query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
+        # key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
+        # value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
 
-        cos, sin = position_embeddings # ([1, 5, 64], [1, 5, 64])
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states_h = self.q_d_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
+        key_states_h = self.k_d_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
+        value_states_h = self.v_d_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+
+        # cos, sin = position_embeddings # ([1, 5, 64], [1, 5, 64])
+        cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        B_q, B_k = self.get_up_cb_matrix()
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
+
+        query_states = self.q_u_proj(query_states_h)
+        key_states = self.k_u_proj(key_states_h)
+        value_states = self.v_u_proj(value_states_h)
 
         if past_key_value is not None:
+            """ change: 注意这个地方的cache之后 """
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {"cos_sin_matrix":cos_size_matrix, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
@@ -511,6 +741,7 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.my_rotary_emb = LlamaRotaryEmbeddingmy(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -575,7 +806,8 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = inputs_embeds #torch.Size([1, 5, 384])
 
         # create position embeddings to be shared across the decoder layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids) # (torch.Size([1, 5, 64]), torch.Size([1, 5, 64]))
+        # position_embeddings = self.rotary_emb(hidden_states, position_ids) # (torch.Size([1, 5, 64]), torch.Size([1, 5, 64]))
+        position_embeddings = self.my_rotary_emb(hidden_states, position_ids)
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None

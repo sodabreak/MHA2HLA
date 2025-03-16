@@ -50,9 +50,9 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.models.llama.configuration_llama import LlamaConfig
 
-if is_torch_flex_attn_available():
-    from torch.nn.attention.flex_attention import BlockMask
-    from transformers.integrations.flex_attention import make_flex_block_causal_mask
+# if is_torch_flex_attn_available():
+#     from torch.nn.attention.flex_attention import BlockMask
+#     from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 
 
@@ -173,10 +173,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    cos = cos.unsqueeze(unsqueeze_dim) # [1, 1, 5, 64]
+    sin = sin.unsqueeze(unsqueeze_dim) # [1, 1, 5, 64]
+    q_embed = (q * cos) + (rotate_half(q) * sin) # [1, 6, 5, 64]
+    k_embed = (k * cos) + (rotate_half(k) * sin) # [1, 6, 5, 64]
     return q_embed, k_embed
 
 
