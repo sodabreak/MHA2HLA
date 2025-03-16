@@ -1,0 +1,27 @@
+name: Pull Request Test
+
+on:
+  pull_request:
+    branches:
+      - main  
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.9"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Run modeling_llama_HLA.py
+        run: |
+          python modeling_llama_HLA.py 
+
