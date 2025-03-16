@@ -18,3 +18,5 @@
 - try model 60m/200m
   
 to be continued...
+
+change PR rule
