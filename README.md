@@ -36,9 +36,9 @@ https://drive.google.com/drive/folders/1cg_nFA9tmdDLZJ7h3oUyqO-vubNTQHLP?usp=sha
 5 epoch training on wikitext-2-v1 
 
 
-## Achivements:
+## Achievements:
 - Prove:
-    - 1. Prove the math of transforming the RoPE to latent space to save the cache space and computaional time. 
+    - Prove the math of transforming the RoPE to latent space to save the cache space and computaional time. 
 - implement:
     - 1. Finetuned the 60m model on wiki dataset: as the baseline
     - 2. Test the perplexity of origianl checkpoint and finetuned checkpoint from origianl model.
