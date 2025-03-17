@@ -34,3 +34,22 @@ this allow a test before push
 ## Google drive containing models
 https://drive.google.com/drive/folders/1cg_nFA9tmdDLZJ7h3oUyqO-vubNTQHLP?usp=sharing
 5 epoch training on wikitext-2-v1 
+
+
+## Achivements:
+- Prove:
+    - 1. Prove the math of transforming the RoPE to latent space to save the cache space and computaional time. 
+- implement:
+    - 1. Finetuned the 60m model on wiki dataset: as the baseline
+    - 2. Test the perplexity of origianl checkpoint and finetuned checkpoint from origianl model.
+    - 3. Implement the MLA code:
+        - apply SVD to qkv_proj.weight to get up and down scale matrix
+        - apply down-scale matrix to hidden_state to get the C(latent) state.
+        - apply SVD to up-scale matrix to get the B matrix, and compute RoPE to C(latent) state.
+        - cache key_states_h and queue_states_h
+        - apply up-scale matrix to recover to original dimention to compute attenntion.
+
+## TODO
+- 1. finetune the original model to see the baseline
+- 2. solve the problem of SVD
+- 3. training tests to see the influence
