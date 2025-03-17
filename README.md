@@ -51,5 +51,7 @@ https://drive.google.com/drive/folders/1cg_nFA9tmdDLZJ7h3oUyqO-vubNTQHLP?usp=sha
 
 ## TODO
 - 1. finetune the original model to see the baseline
-- 2. solve the problem of SVD
-- 3. training tests to see the influence
+- 2. solve the problem of SVD: the computation of SVD is slow
+    - set B matrix as learnable parameters
+    - use fast SVD 
+- 3. finish training lists as below to see the influence
