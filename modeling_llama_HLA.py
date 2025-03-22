@@ -302,11 +302,6 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
     return q_embed, k_embed
 
 def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
-    # print("q shape: ", q.shape)
-    # print("k shape: ", k.shape)
-    # print("cos_size_matrix shape: ", cos_size_matrix.shape)
-    # print("B_q shape: ", B_q.shape)
-    # print("B_k shape: ", B_k.shape)
     batch_size, num_heads_q, seq_len, head_dim = q.shape
     _, num_heads_k, _, _ = k.shape
     head_dim_half = head_dim // 2
@@ -408,6 +403,63 @@ def apply_rotary_pos_emb_hla_fast_opt(q, k, cos_size_matrix, B_q, B_k):
     k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
 
     return q_embed, k_embed
+
+def apply_rotary_pos_emb_hla_fast_opt_v2(q, k, cos_size_matrix, B_q, B_k):
+    batch_size, num_heads_q, seq_len, head_dim = q.shape
+    _, num_heads_k, _, _ = k.shape
+    head_dim_half = head_dim // 2
+    device = q.device
+    dtype = q.dtype
+
+    # ---------------------- 预计算静态参数 ----------------------
+    # 将B矩阵预处理为 [s*n, 2, D] 形式 (避免运行时重复展开)
+    def preprocess_B(B, num_heads):
+        num_blocks = num_heads * head_dim_half
+        B_blocks = B.view(num_blocks, 2, -1)  # [n, 2, D]
+        return B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1).reshape(-1, 2, B.shape[-1])  # [s*n, 2, D]
+
+    # 将cos矩阵预处理为 [s*n, 2, 2] 形式
+    def preprocess_cos(cos, num_heads):
+        return (cos[:, :head_dim_half]
+                .unsqueeze(1)
+                .expand(-1, num_heads, -1, -1, -1)
+                .reshape(seq_len, num_heads * head_dim_half, 2, 2)
+                .reshape(-1, 2, 2)
+                .to(dtype=dtype, device=device))
+
+    # ---------------------- 核心计算优化 ----------------------
+    def optimized_transform(x, B, cos):
+        # 合并矩阵乘法链: (B^T @ R) @ B → B^T @ (R @ B)
+        B_float = B.to(dtype)
+        R_B = torch.bmm(cos, B_float)  # [s*n, 2, D]
+        BTRB = torch.bmm(B_float.transpose(1, 2), R_B)  # [s*n, D, D]
+        
+        # 重组为 [s, n, D, D]
+        BTRB = BTRB.view(seq_len, -1, BTRB.shape[-2], BTRB.shape[-1])
+        
+        # 高效矩阵乘法替代 einsum
+        x = x.view(batch_size, seq_len, 1, -1)  # [b, s, 1, nh*d]
+        x_expanded = x.unsqueeze(3)  # [b, s, 1, 1, D]
+        result = torch.matmul(x_expanded, BTRB.unsqueeze(0))  # [b, s, 1, 1, D]
+        return result.squeeze(3).squeeze(2).sum(dim=2)  # [b, s, D]
+
+    # ---------------------- 执行流程 ----------------------
+    # 预处理参数
+    B_q_pre = preprocess_B(B_q, num_heads_q)
+    B_k_pre = preprocess_B(B_k, num_heads_k)
+    cos_q = preprocess_cos(cos_size_matrix, num_heads_q)
+    cos_k = preprocess_cos(cos_size_matrix, num_heads_k)
+
+    # 合并多头维度
+    q_concat = q.permute(0, 2, 1, 3).flatten(2)  # [b, s, nh*d]
+    k_concat = k.permute(0, 2, 1, 3).flatten(2)
+
+    # 执行变换
+    q_trans = optimized_transform(q_concat, B_q_pre, cos_q)
+    k_trans = optimized_transform(k_concat, B_k_pre, cos_k)
+
+    # 恢复形状
+    return q_trans.view(batch_size, seq_len, num_heads_q* head_dim), k_trans.view(batch_size, seq_len, num_heads_k* head_dim)
 
 # # 将内部函数提取为静态方法（避免动态闭包影响编译）
 # @torch.compile(dynamic=True, fullgraph=False, mode="max-autotune")
