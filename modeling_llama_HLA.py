@@ -597,8 +597,8 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         self.init = False
         self.init_B = False
-        self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
-        self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
+        # self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
+        # self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -755,15 +755,15 @@ class LlamaAttention(nn.Module):
 
         cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
 
-        # B_q, B_k = self.get_up_cb_matrix()
-        if not self.init_B:
-            B_q, B_k = self.get_up_cb_matrix_fast()
-            self.B_q = nn.Parameter(B_q.clone().detach())
-            self.B_k = nn.Parameter(B_k.clone().detach())
-            self.init = True
+        B_q, B_k = self.get_up_cb_matrix()
+        # if not self.init_B:
+        #     B_q, B_k = self.get_up_cb_matrix_fast()
+        #     self.B_q = nn.Parameter(B_q.clone().detach())
+        #     self.B_k = nn.Parameter(B_k.clone().detach())
+        #     self.init = True
 
         # query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix, self.B_q,self.B_k)
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix,B_q,B_k)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
 
         if past_key_value is not None:
