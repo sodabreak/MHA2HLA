@@ -159,6 +159,7 @@ class LlamaRotaryEmbeddingmy(nn.Module):
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq = inv_freq[: inv_freq.shape[0] // 2]
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
@@ -166,6 +167,7 @@ class LlamaRotaryEmbeddingmy(nn.Module):
         seq_len = torch.max(position_ids) + 1
         if seq_len > self.max_seq_len_cached:
             inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            inv_freq = inv_freq[: inv_freq.shape[0] // 2]
             self.register_buffer("inv_freq", inv_freq, persistent=False)
             self.max_seq_len_cached = seq_len
 
@@ -187,9 +189,9 @@ class LlamaRotaryEmbeddingmy(nn.Module):
         device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
-            emb = torch.cat((freqs, freqs), dim=-1)
-            cos = emb.cos()  # 形状: [batch_size, seq_len, head_dim//2]
-            sin = emb.sin()  # 形状: [batch_size, seq_len, head_dim//2]
+            # emb = torch.cat((freqs, freqs), dim=-1)
+            cos = freqs.cos()  # 形状: [batch_size, seq_len, head_dim//2]
+            sin = freqs.sin()  # 形状: [batch_size, seq_len, head_dim//2]
 
         # 应用 RoPE 位置缩放
         cos = cos * self.attention_scaling
@@ -246,8 +248,8 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
         q (`torch.Tensor`): The query tensor. Shape: [batch, num_heads, seq_len, 32]
         k (`torch.Tensor`): The key tensor. Shape: [batch, num_heads, seq_len, 32]
         cos_size_matrix (`torch.Tensor`): The RoPE matrix. Shape: [seq_len, head_dim//2, 2, 2]
-        B_q (`torch.Tensor`): The transformation matrix for q. Shape: [2, num_heads*32]
-        B_k (`torch.Tensor`): The transformation matrix for k. Shape: [2, num_heads*32]
+        B_q (`torch.Tensor`): The transformation matrix for q. Shape: [num_heads*32, num_heads*32]
+        B_k (`torch.Tensor`): The transformation matrix for k. Shape: [num_heads*32, num_heads*32]
         position_ids (`torch.Tensor`, *optional*): Position indices (not used here)
         unsqueeze_dim (`int`, *optional*, defaults to 1): 
             Specifies the dimension along which to unsqueeze for broadcasting.
@@ -270,27 +272,28 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
     q_transformed = torch.zeros_like(q_concat)  # [batch, seq_len, num_heads*32]
     k_transformed = torch.zeros_like(k_concat)  # [batch, seq_len, num_heads*32]
 
-    for i in range(head_dim_half):
-        rope_matrix_h = cos_size_matrix[:, i, :, :]  # [seq_len, 2, 2]
-        B_q_2 = B_q[:2, :]  # [2, num_heads*32]
-        B_k_2 = B_k[:2, :]  # [2, num_heads*32]
-
+    for i in range(head_dim_half * num_heads_q):
+        rope_matrix_h = cos_size_matrix[:, i%head_dim_half, :, :]  # [seq_len, 2, 2]
+        B_q_2 = B_q[2*i:2*(i+1), :]  # [2, num_heads*32]
         # `B' * R`
         B_q_rot = torch.matmul(B_q_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # Convert both to float16
-        B_k_rot = torch.matmul(B_k_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # 
-
         # `(B' R) B`
         B_q_transformed = torch.matmul(B_q_rot, B_q_2)  # [seq_len, num_heads*32, num_heads*32]
-        B_k_transformed = torch.matmul(B_k_rot, B_k_2)  # [seq_len, num_heads*32, num_heads*32]
-
         q_h = q_concat  # [batch, seq_len, num_heads*32]
-        k_h = k_concat  # [batch, seq_len, num_heads*32]
-
         # `q' = (B' R B) q`
         q_final = torch.einsum("bsi,sij->bsj", q_h, B_q_transformed)  # [batch, seq_len, num_heads*32]
-        k_final = torch.einsum("bsi,sij->bsj", k_h, B_k_transformed)  # [batch, seq_len, num_heads*32]
-
         q_transformed += q_final
+
+    for i in range(head_dim_half * num_heads_k):
+        rope_matrix_h = cos_size_matrix[:, i%head_dim_half, :, :]  # [seq_len, 2, 2]
+        B_k_2 = B_k[2*i:2*(i+1), :]  # [2, num_heads*32]
+        # `B' * R`
+        B_k_rot = torch.matmul(B_k_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # 
+        # `(B' R) B`
+        B_k_transformed = torch.matmul(B_k_rot, B_k_2)  # [seq_len, num_heads*32, num_heads*32]
+        k_h = k_concat  # [batch, seq_len, num_heads*32]
+        # `q' = (B' R B) q`
+        k_final = torch.einsum("bsi,sij->bsj", k_h, B_k_transformed)  # [batch, seq_len, num_heads*32]
         k_transformed += k_final
 
     q_embed = q_transformed.view(batch_size, seq_len, num_heads_q * head_dim)
@@ -298,6 +301,57 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
 
     return q_embed, k_embed
 
+def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
+    batch_size, num_heads_q, seq_len, head_dim = q.shape
+    _, num_heads_k, _, _ = k.shape
+    head_dim_half = head_dim // 2
+    total_dim_q = num_heads_q * head_dim
+    total_dim_k = num_heads_k * head_dim
+
+    # Merge multi-head dimensions [batch, seq_len, total_dim]
+    q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_q)
+    k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_k)
+
+    # Core transformation function
+    def parallel_transform(x, B, num_heads, cos_matrix):
+        # Parameter reorganization
+        num_blocks = num_heads * head_dim_half  # Total blocks = num_heads × 16
+        
+        # Reorganize B matrix to [seq_len, num_blocks, 2, total_dim]
+        B_blocks = B.view(num_blocks, 2, -1)  # [n_blocks, 2, D]
+        B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1)  # [s, n_blocks, 2, D]
+        
+        # Expand cos matrix to [seq_len, num_blocks, 2, 2]
+        cos_expanded = cos_matrix[:, :head_dim_half]  # [s, 16, 2, 2]
+        cos_expanded = cos_expanded.unsqueeze(1)  # [s, 1, 16, 2, 2]
+        cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1)  # [s, nh, 16, 2, 2]
+        cos_expanded = cos_expanded.reshape(seq_len, num_blocks, 2, 2)  # [s, n_blocks, 2, 2]
+
+        # Calculate B'R [s, n_blocks, D, 2]
+        B_rot = torch.einsum('snij,snjk->snik', 
+                            B_blocks.transpose(2,3).to(torch.float16),  # [s,n_blocks,D,2]
+                            cos_expanded.to(torch.float16))              # [s,n_blocks,2,2]
+        
+        # Calculate (B'R)B [s, n_blocks, D, D]
+        B_trans = torch.einsum('snik,snkj->snij',  # Key dimension alignment fix
+                             B_rot,                # [s,n_blocks,D,2]
+                             B_blocks.to(torch.float16))  # [s,n_blocks,2,D]
+        
+        # Apply transformation and accumulate [batch, seq_len, D]
+        x_trans = torch.einsum('bsd,snij->bsnj', 
+                              x.to(torch.float16),  # [batch, s, D]
+                              B_trans)              # [s,n_blocks,D,D]
+        return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
+
+    # Execute transformations
+    q_transformed = parallel_transform(q_concat, B_q, num_heads_q, cos_size_matrix)
+    k_transformed = parallel_transform(k_concat, B_k, num_heads_k, cos_size_matrix)
+
+    # Restore original shape [batch, num_heads, seq_len, head_dim]
+    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q* head_dim)
+    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
+
+    return q_embed, k_embed
 
 class LlamaMLP(nn.Module):
     def __init__(self, config):
@@ -367,8 +421,8 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         self.init = False
         self.init_B = False
-        self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
-        self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
+        # self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
+        # self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -525,14 +579,15 @@ class LlamaAttention(nn.Module):
 
         cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
 
-        # B_q, B_k = self.get_up_cb_matrix()
-        if not self.init_B:
-            B_q, B_k = self.get_up_cb_matrix_fast()
-            self.B_q = nn.Parameter(B_q.clone().detach())
-            self.B_k = nn.Parameter(B_k.clone().detach())
-            self.init = True
+        B_q, B_k = self.get_up_cb_matrix()
+        # if not self.init_B:
+        #     B_q, B_k = self.get_up_cb_matrix_fast()
+        #     self.B_q = nn.Parameter(B_q.clone().detach())
+        #     self.B_k = nn.Parameter(B_k.clone().detach())
+        #     self.init = True
 
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, self.B_q, self.B_k)
+        # query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, self.B_q, self.B_k)
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix, B_q,B_k)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
 
         if past_key_value is not None:
