@@ -302,6 +302,11 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
     return q_embed, k_embed
 
 def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
+    # print("q shape: ", q.shape)
+    # print("k shape: ", k.shape)
+    # print("cos_size_matrix shape: ", cos_size_matrix.shape)
+    # print("B_q shape: ", B_q.shape)
+    # print("B_k shape: ", B_k.shape)
     batch_size, num_heads_q, seq_len, head_dim = q.shape
     _, num_heads_k, _, _ = k.shape
     head_dim_half = head_dim // 2
@@ -352,6 +357,125 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
     k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
 
     return q_embed, k_embed
+
+def apply_rotary_pos_emb_hla_fast_opt(q, k, cos_size_matrix, B_q, B_k):
+    batch_size, num_heads_q, seq_len, head_dim = q.shape
+    _, num_heads_k, _, _ = k.shape
+    head_dim_half = head_dim // 2
+    total_dim_q = num_heads_q * head_dim
+    total_dim_k = num_heads_k * head_dim
+
+    # 合并多头维度并确保内存连续
+    q_concat = q.permute(0, 2, 1, 3).contiguous().reshape(batch_size, seq_len, total_dim_q)
+    k_concat = k.permute(0, 2, 1, 3).contiguous().reshape(batch_size, seq_len, total_dim_k)
+
+    def parallel_transform(x, B, num_heads, cos_matrix):
+        device = x.device
+        dtype = x.dtype
+        num_blocks = num_heads * head_dim_half
+        s = seq_len
+        D = B.shape[-1]
+
+        # 处理B矩阵
+        B_blocks = B.view(num_blocks, 2, D)
+        B_blocks = B_blocks.unsqueeze(0).expand(s, -1, -1, -1)  # [s, n, 2, D]
+        s, n, two, D = B_blocks.shape
+        B_blocks = B_blocks.contiguous().view(s * n, two, D)
+
+        # 处理cos矩阵
+        cos_expanded = cos_matrix[:, :head_dim_half].unsqueeze(1)  # [s, 1, 16, 2, 2]
+        cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1).contiguous()  # [s, nh, 16, 2, 2]
+        cos_expanded = cos_expanded.view(s, num_blocks, 2, 2).contiguous()  # [s, n, 2, 2]
+        cos_expanded = cos_expanded.view(s * n, 2, 2).to(dtype).to(device)
+
+        # 批量矩阵乘法计算B_rot和B_trans
+        B_blocks_float = B_blocks.to(dtype)
+        B_blocks_transposed = torch.transpose(B_blocks_float, 1, 2)  # [s*n, D, 2]
+        B_rot = torch.bmm(B_blocks_transposed, cos_expanded)  # [s*n, D, 2]
+        B_trans = torch.bmm(B_rot, B_blocks_float)  # [s*n, D, D]
+        B_trans = B_trans.view(s, n, D, D)  # [s, n, D, D]
+
+        # 应用变换
+        x_float = x.to(dtype)
+        x_trans = torch.einsum('bsd,sndd->bsnd', x_float, B_trans)  # 自动广播
+        return x_trans.sum(dim=2).to(dtype)
+
+    # 执行变换并恢复原始形状
+    q_transformed = parallel_transform(q_concat, B_q, num_heads_q, cos_size_matrix)
+    k_transformed = parallel_transform(k_concat, B_k, num_heads_k, cos_size_matrix)
+
+    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q* head_dim)
+    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
+
+    return q_embed, k_embed
+
+# # 将内部函数提取为静态方法（避免动态闭包影响编译）
+# @torch.compile(dynamic=True, fullgraph=False, mode="max-autotune")
+# def parallel_transform_compiled(
+#     x: torch.Tensor, 
+#     B_blocks: torch.Tensor, 
+#     cos_expanded: torch.Tensor,
+#     num_blocks: int,
+#     D: int
+# ) -> torch.Tensor:
+#     # 批量矩阵计算优化为单一kernel
+#     B_blocks_float = B_blocks.to(x.dtype)
+    
+#     # 转置与矩阵乘法融合
+#     B_rot = torch.bmm(
+#         B_blocks_float.transpose(1,2),  # [s*n, D, 2]
+#         cos_expanded                     # [s*n, 2, 2]
+#     )
+    
+#     # 矩阵链式乘法优化
+#     B_trans = torch.bmm(B_rot, B_blocks_float)  # [s*n, D, D]
+#     B_trans = B_trans.view(-1, num_blocks, D, D)  # [s, n, D, D]
+    
+#     # 替换einsum为广播乘法（编译更友好）
+#     x_trans = (x.unsqueeze(2).to(x.dtype) @ B_trans.permute(0,1,3,2))
+#     return x_trans.squeeze(2)
+
+# def apply_rotary_pos_emb_compiled(q, k, cos_size_matrix, B_q, B_k):
+#     # 静态形状提取（编译时固定）
+#     batch_size, num_heads_q, seq_len, head_dim = q.shape
+#     _, num_heads_k, _, _ = k.shape
+#     head_dim_half = head_dim // 2
+    
+#     # 预计算B和cos的静态参数
+#     B_q_preprocessed = _preprocess_B(B_q, seq_len, num_heads_q, head_dim_half)
+#     B_k_preprocessed = _preprocess_B(B_k, seq_len, num_heads_k, head_dim_half)
+#     cos_q = _preprocess_cos(cos_size_matrix, num_heads_q, head_dim_half)
+#     cos_k = _preprocess_cos(cos_size_matrix, num_heads_k, head_dim_half)
+
+#     # 合并多头维度（保持连续内存布局）
+#     q_concat = q.permute(0,2,1,3).contiguous().view(batch_size, seq_len, -1)
+#     k_concat = k.permute(0,2,1,3).contiguous().view(batch_size, seq_len, -1)
+
+#     # 执行编译优化的核心变换
+#     q_trans = parallel_transform_compiled(
+#         q_concat, B_q_preprocessed, cos_q, 
+#         num_heads_q * head_dim_half, B_q.shape[-1]
+#     )
+#     k_trans = parallel_transform_compiled(
+#         k_concat, B_k_preprocessed, cos_k,
+#         num_heads_k * head_dim_half, B_k.shape[-1]
+#     )
+
+#     # 输出形状重构
+#     return q_trans.view(batch_size, seq_len, num_heads_q* head_dim), k_trans.view(batch_size, seq_len, num_heads_k* head_dim)
+
+# # 预处理器函数（静态参数计算）
+# def _preprocess_B(B: torch.Tensor, seq_len: int, num_heads: int, head_dim_half: int):
+#     num_blocks = num_heads * head_dim_half
+#     B_blocks = B.view(num_blocks, 2, -1)
+#     B_expanded = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1)  # [s, n, 2, D]
+#     return B_expanded.contiguous().view(seq_len * num_blocks, 2, -1)
+
+# def _preprocess_cos(cos: torch.Tensor, num_heads: int, head_dim_half: int):
+#     cos_expanded = cos[:, :head_dim_half].unsqueeze(1)  # [s, 1, 16, 2, 2]
+#     cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1).contiguous()
+#     return cos_expanded.view(cos.size(0), num_heads * head_dim_half, 2, 2).view(-1, 2, 2)
+
 
 class LlamaMLP(nn.Module):
     def __init__(self, config):
@@ -421,8 +545,8 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         self.init = False
         self.init_B = False
-        # self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
-        # self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
+        self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
+        self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -579,15 +703,15 @@ class LlamaAttention(nn.Module):
 
         cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
 
-        B_q, B_k = self.get_up_cb_matrix()
-        # if not self.init_B:
-        #     B_q, B_k = self.get_up_cb_matrix_fast()
-        #     self.B_q = nn.Parameter(B_q.clone().detach())
-        #     self.B_k = nn.Parameter(B_k.clone().detach())
-        #     self.init = True
+        # B_q, B_k = self.get_up_cb_matrix()
+        if not self.init_B:
+            B_q, B_k = self.get_up_cb_matrix_fast()
+            self.B_q = nn.Parameter(B_q.clone().detach())
+            self.B_k = nn.Parameter(B_k.clone().detach())
+            self.init = True
 
-        # query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, self.B_q, self.B_k)
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix, B_q,B_k)
+        # query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast_opt(query_states_h, key_states_h, cos_size_matrix, self.B_q,self.B_k)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
 
         if past_key_value is not None:
