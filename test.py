@@ -93,17 +93,17 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
 
         # Calculate B'R [s, n_blocks, D, 2]
         B_rot = torch.einsum('snij,snjk->snik', 
-                            B_blocks.transpose(2,3).to(torch.float16),  # [s,n_blocks,D,2]
-                            cos_expanded.to(torch.float16))              # [s,n_blocks,2,2]
+                            B_blocks.transpose(2,3),  # [s,n_blocks,D,2]
+                            cos_expanded)           # [s,n_blocks,2,2]
         
         # Calculate (B'R)B [s, n_blocks, D, D]
         B_trans = torch.einsum('snik,snkj->snij',  # Key dimension alignment fix
                              B_rot,                # [s,n_blocks,D,2]
-                             B_blocks.to(torch.float16))  # [s,n_blocks,2,D]
+                             B_blocks)  # [s,n_blocks,2,D]
         
         # Apply transformation and accumulate [batch, seq_len, D]
         x_trans = torch.einsum('bsd,snij->bsnj', 
-                              x.to(torch.float16),  # [batch, s, D]
+                              x,  # [batch, s, D]
                               B_trans)              # [s,n_blocks,D,D]
         return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
 
@@ -249,7 +249,7 @@ if __name__ == '__main__':
     B_q = torch.randn(192, 192, device="cuda")
     B_k = torch.randn(64, 64, device="cuda")
     # 测试原始版本
-    t1 = benchmark(apply_rotary_pos_emb_hla, q, k, cos_size_matrix, B_q, B_k)
+    t1 = benchmark(apply_rotary_pos_emb_hla_fast_opt, q, k, cos_size_matrix, B_q, B_k)
 
     # 测试优化版本
     t2 = benchmark(apply_rotary_pos_emb_hla_fast, q, k, cos_size_matrix, B_q, B_k)

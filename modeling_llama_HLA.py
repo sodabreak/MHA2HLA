@@ -319,7 +319,7 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
         
         # Reorganize B matrix to [seq_len, num_blocks, 2, total_dim]
         B_blocks = B.view(num_blocks, 2, -1)  # [n_blocks, 2, D]
-        B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1)  # [s, n_blocks, 2, D]
+        B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1).to(torch.float32)  # [s, n_blocks, 2, D]
         
         # Expand cos matrix to [seq_len, num_blocks, 2, 2]
         cos_expanded = cos_matrix[:, :head_dim_half]  # [s, 16, 2, 2]
@@ -329,17 +329,17 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
 
         # Calculate B'R [s, n_blocks, D, 2]
         B_rot = torch.einsum('snij,snjk->snik', 
-                            B_blocks.transpose(2,3).to(torch.float16),  # [s,n_blocks,D,2]
-                            cos_expanded.to(torch.float16))              # [s,n_blocks,2,2]
+                            B_blocks.transpose(2,3),  # [s,n_blocks,D,2]
+                            cos_expanded)              # [s,n_blocks,2,2]
         
         # Calculate (B'R)B [s, n_blocks, D, D]
         B_trans = torch.einsum('snik,snkj->snij',  # Key dimension alignment fix
                              B_rot,                # [s,n_blocks,D,2]
-                             B_blocks.to(torch.float16))  # [s,n_blocks,2,D]
+                             B_blocks)  # [s,n_blocks,2,D]
         
         # Apply transformation and accumulate [batch, seq_len, D]
         x_trans = torch.einsum('bsd,snij->bsnj', 
-                              x.to(torch.float16),  # [batch, s, D]
+                              x,  # [batch, s, D]
                               B_trans)              # [s,n_blocks,D,D]
         return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
 
@@ -763,7 +763,7 @@ class LlamaAttention(nn.Module):
             self.init = True
 
         # query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast_opt(query_states_h, key_states_h, cos_size_matrix, self.B_q,self.B_k)
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix, self.B_q,self.B_k)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
 
         if past_key_value is not None:
