@@ -55,7 +55,6 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 #     from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 
-
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
@@ -145,72 +144,11 @@ class LlamaRotaryEmbedding(nn.Module):
 
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
-class LlamaRotaryEmbeddingmy(nn.Module):
-    def __init__(self, config, device=None):
-        super().__init__()
-        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
-        else:
-            self.rope_type = "default"
-
-        self.max_seq_len_cached = config.max_position_embeddings
-        self.original_max_seq_len = config.max_position_embeddings
-        self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
-
-        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
-        inv_freq = inv_freq[: inv_freq.shape[0] // 2]
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
-
-    def _dynamic_frequency_update(self, position_ids, device):
-        seq_len = torch.max(position_ids) + 1
-        if seq_len > self.max_seq_len_cached:
-            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
-            inv_freq = inv_freq[: inv_freq.shape[0] // 2]
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-            self.max_seq_len_cached = seq_len
-
-        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:
-            self.original_inv_freq = self.original_inv_freq.to(device)
-            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
-            self.max_seq_len_cached = self.original_max_seq_len
-
-    @torch.no_grad()
-    def forward(self, x, position_ids):
-        if "dynamic" in self.rope_type:
-            self._dynamic_frequency_update(position_ids, device=x.device)
-
-        # 计算 RoPE 角度
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        with torch.autocast(device_type=device_type, enabled=False):
-            freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
-            # emb = torch.cat((freqs, freqs), dim=-1)
-            cos = freqs.cos()  # 形状: [batch_size, seq_len, head_dim//2]
-            sin = freqs.sin()  # 形状: [batch_size, seq_len, head_dim//2]
-
-        # 应用 RoPE 位置缩放
-        cos = cos * self.attention_scaling
-        sin = sin * self.attention_scaling
-
-        # 变换为旋转矩阵形式 `[seq_len, head_dim//2, 2, 2]`
-        rope_matrix = torch.zeros((cos.shape[1], cos.shape[2], 2, 2), device=cos.device, dtype=cos.dtype)
-        rope_matrix[..., 0, 0] = cos.squeeze(0)  # cos(θ)
-        rope_matrix[..., 0, 1] = -sin.squeeze(0)  # -sin(θ)
-        rope_matrix[..., 1, 0] = sin.squeeze(0)  # sin(θ)
-        rope_matrix[..., 1, 1] = cos.squeeze(0)  # cos(θ)
-
-        return rope_matrix  # [seq_len, head_dim//2, 2, 2]
-
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -234,299 +172,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     Returns:
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    cos = cos.unsqueeze(unsqueeze_dim)  # [1, 1, 5, 64]
+    sin = sin.unsqueeze(unsqueeze_dim)  # [1, 1, 5, 64]
+    q_embed = (q * cos) + (rotate_half(q) * sin)  # [1, 6, 5, 64]
+    k_embed = (k * cos) + (rotate_half(k) * sin)  # [1, 6, 5, 64]
     return q_embed, k_embed
-
-def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None, unsqueeze_dim=1):
-    """
-    Applies Rotary Position Embedding to the query and key tensors with head-level adaptation.
-
-    Args:
-        q (`torch.Tensor`): The query tensor. Shape: [batch, num_heads, seq_len, 32]
-        k (`torch.Tensor`): The key tensor. Shape: [batch, num_heads, seq_len, 32]
-        cos_size_matrix (`torch.Tensor`): The RoPE matrix. Shape: [seq_len, head_dim//2, 2, 2]
-        B_q (`torch.Tensor`): The transformation matrix for q. Shape: [num_heads*32, num_heads*32]
-        B_k (`torch.Tensor`): The transformation matrix for k. Shape: [num_heads*32, num_heads*32]
-        position_ids (`torch.Tensor`, *optional*): Position indices (not used here)
-        unsqueeze_dim (`int`, *optional*, defaults to 1): 
-            Specifies the dimension along which to unsqueeze for broadcasting.
-    
-    Returns:
-        `tuple(torch.Tensor)`: The transformed query and key tensors.
-    """
-    batch_size, num_heads_q, seq_len, head_dim = q.shape  # [batch, num_heads, seq_len, 32]
-    batch_size, num_heads_k, seq_len, head_dim = k.shape  
-    head_dim_half = head_dim // 2  # 32 -> 16
-    total_dim_q = num_heads_q * head_dim  # `num_heads * 32`
-    total_dim_k = num_heads_k * head_dim
-
-    q_embed = torch.zeros_like(q)
-    k_embed = torch.zeros_like(k)
-
-    q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_q)  # [batch, seq_len, num_heads*32]
-    k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_k)  # [batch, seq_len, num_heads*32]
-
-    q_transformed = torch.zeros_like(q_concat)  # [batch, seq_len, num_heads*32]
-    k_transformed = torch.zeros_like(k_concat)  # [batch, seq_len, num_heads*32]
-
-    for i in range(head_dim_half * num_heads_q):
-        rope_matrix_h = cos_size_matrix[:, i%head_dim_half, :, :]  # [seq_len, 2, 2]
-        B_q_2 = B_q[2*i:2*(i+1), :]  # [2, num_heads*32]
-        # `B' * R`
-        B_q_rot = torch.matmul(B_q_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # Convert both to float16
-        # `(B' R) B`
-        B_q_transformed = torch.matmul(B_q_rot, B_q_2)  # [seq_len, num_heads*32, num_heads*32]
-        q_h = q_concat  # [batch, seq_len, num_heads*32]
-        # `q' = (B' R B) q`
-        q_final = torch.einsum("bsi,sij->bsj", q_h, B_q_transformed)  # [batch, seq_len, num_heads*32]
-        q_transformed += q_final
-
-    for i in range(head_dim_half * num_heads_k):
-        rope_matrix_h = cos_size_matrix[:, i%head_dim_half, :, :]  # [seq_len, 2, 2]
-        B_k_2 = B_k[2*i:2*(i+1), :]  # [2, num_heads*32]
-        # `B' * R`
-        B_k_rot = torch.matmul(B_k_2.T.to(torch.float16), rope_matrix_h.to(torch.float16))  # 
-        # `(B' R) B`
-        B_k_transformed = torch.matmul(B_k_rot, B_k_2)  # [seq_len, num_heads*32, num_heads*32]
-        k_h = k_concat  # [batch, seq_len, num_heads*32]
-        # `q' = (B' R B) q`
-        k_final = torch.einsum("bsi,sij->bsj", k_h, B_k_transformed)  # [batch, seq_len, num_heads*32]
-        k_transformed += k_final
-
-    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q * head_dim)
-    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k * head_dim)
-
-    return q_embed, k_embed
-
-def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
-    batch_size, num_heads_q, seq_len, head_dim = q.shape
-    _, num_heads_k, _, _ = k.shape
-    head_dim_half = head_dim // 2
-    total_dim_q = num_heads_q * head_dim
-    total_dim_k = num_heads_k * head_dim
-
-    # Merge multi-head dimensions [batch, seq_len, total_dim]
-    q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_q)
-    k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_k)
-
-    # Core transformation function
-    def parallel_transform(x, B, num_heads, cos_matrix):
-        # Parameter reorganization
-        num_blocks = num_heads * head_dim_half  # Total blocks = num_heads × 16
-        
-        # Reorganize B matrix to [seq_len, num_blocks, 2, total_dim]
-        B_blocks = B.view(num_blocks, 2, -1)  # [n_blocks, 2, D]
-        B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1).to(torch.float32)  # [s, n_blocks, 2, D]
-        
-        # Expand cos matrix to [seq_len, num_blocks, 2, 2]
-        cos_expanded = cos_matrix[:, :head_dim_half]  # [s, 16, 2, 2]
-        cos_expanded = cos_expanded.unsqueeze(1)  # [s, 1, 16, 2, 2]
-        cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1)  # [s, nh, 16, 2, 2]
-        cos_expanded = cos_expanded.reshape(seq_len, num_blocks, 2, 2)  # [s, n_blocks, 2, 2]
-
-        # Calculate B'R [s, n_blocks, D, 2]
-        B_rot = torch.einsum('snij,snjk->snik', 
-                            B_blocks.transpose(2,3),  # [s,n_blocks,D,2]
-                            cos_expanded)              # [s,n_blocks,2,2]
-        
-        # Calculate (B'R)B [s, n_blocks, D, D]
-        B_trans = torch.einsum('snik,snkj->snij',  # Key dimension alignment fix
-                             B_rot,                # [s,n_blocks,D,2]
-                             B_blocks)  # [s,n_blocks,2,D]
-        
-        # Apply transformation and accumulate [batch, seq_len, D]
-        x_trans = torch.einsum('bsd,snij->bsnj', 
-                              x,  # [batch, s, D]
-                              B_trans)              # [s,n_blocks,D,D]
-        return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
-
-    # Execute transformations
-    q_transformed = parallel_transform(q_concat, B_q, num_heads_q, cos_size_matrix)
-    k_transformed = parallel_transform(k_concat, B_k, num_heads_k, cos_size_matrix)
-
-    # Restore original shape [batch, num_heads, seq_len, head_dim]
-    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q* head_dim)
-    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
-
-    return q_embed, k_embed
-
-def apply_rotary_pos_emb_hla_fast_opt(q, k, cos_size_matrix, B_q, B_k):
-    batch_size, num_heads_q, seq_len, head_dim = q.shape
-    _, num_heads_k, _, _ = k.shape
-    head_dim_half = head_dim // 2
-    total_dim_q = num_heads_q * head_dim
-    total_dim_k = num_heads_k * head_dim
-
-    # 合并多头维度并确保内存连续
-    q_concat = q.permute(0, 2, 1, 3).contiguous().reshape(batch_size, seq_len, total_dim_q)
-    k_concat = k.permute(0, 2, 1, 3).contiguous().reshape(batch_size, seq_len, total_dim_k)
-
-    def parallel_transform(x, B, num_heads, cos_matrix):
-        device = x.device
-        dtype = x.dtype
-        num_blocks = num_heads * head_dim_half
-        s = seq_len
-        D = B.shape[-1]
-
-        # 处理B矩阵
-        B_blocks = B.view(num_blocks, 2, D)
-        B_blocks = B_blocks.unsqueeze(0).expand(s, -1, -1, -1)  # [s, n, 2, D]
-        s, n, two, D = B_blocks.shape
-        B_blocks = B_blocks.contiguous().view(s * n, two, D)
-
-        # 处理cos矩阵
-        cos_expanded = cos_matrix[:, :head_dim_half].unsqueeze(1)  # [s, 1, 16, 2, 2]
-        cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1).contiguous()  # [s, nh, 16, 2, 2]
-        cos_expanded = cos_expanded.view(s, num_blocks, 2, 2).contiguous()  # [s, n, 2, 2]
-        cos_expanded = cos_expanded.view(s * n, 2, 2).to(dtype).to(device)
-
-        # 批量矩阵乘法计算B_rot和B_trans
-        B_blocks_float = B_blocks.to(dtype)
-        B_blocks_transposed = torch.transpose(B_blocks_float, 1, 2)  # [s*n, D, 2]
-        B_rot = torch.bmm(B_blocks_transposed, cos_expanded)  # [s*n, D, 2]
-        B_trans = torch.bmm(B_rot, B_blocks_float)  # [s*n, D, D]
-        B_trans = B_trans.view(s, n, D, D)  # [s, n, D, D]
-
-        # 应用变换
-        x_float = x.to(dtype)
-        x_trans = torch.einsum('bsd,sndd->bsnd', x_float, B_trans)  # 自动广播
-        return x_trans.sum(dim=2).to(dtype)
-
-    # 执行变换并恢复原始形状
-    q_transformed = parallel_transform(q_concat, B_q, num_heads_q, cos_size_matrix)
-    k_transformed = parallel_transform(k_concat, B_k, num_heads_k, cos_size_matrix)
-
-    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q* head_dim)
-    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
-
-    return q_embed, k_embed
-
-def apply_rotary_pos_emb_hla_fast_opt_v2(q, k, cos_size_matrix, B_q, B_k):
-    batch_size, num_heads_q, seq_len, head_dim = q.shape
-    _, num_heads_k, _, _ = k.shape
-    head_dim_half = head_dim // 2
-    device = q.device
-    dtype = q.dtype
-
-    # ---------------------- 预计算静态参数 ----------------------
-    # 将B矩阵预处理为 [s*n, 2, D] 形式 (避免运行时重复展开)
-    def preprocess_B(B, num_heads):
-        num_blocks = num_heads * head_dim_half
-        B_blocks = B.view(num_blocks, 2, -1)  # [n, 2, D]
-        return B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1).reshape(-1, 2, B.shape[-1])  # [s*n, 2, D]
-
-    # 将cos矩阵预处理为 [s*n, 2, 2] 形式
-    def preprocess_cos(cos, num_heads):
-        return (cos[:, :head_dim_half]
-                .unsqueeze(1)
-                .expand(-1, num_heads, -1, -1, -1)
-                .reshape(seq_len, num_heads * head_dim_half, 2, 2)
-                .reshape(-1, 2, 2)
-                .to(dtype=dtype, device=device))
-
-    # ---------------------- 核心计算优化 ----------------------
-    def optimized_transform(x, B, cos):
-        # 合并矩阵乘法链: (B^T @ R) @ B → B^T @ (R @ B)
-        B_float = B.to(dtype)
-        R_B = torch.bmm(cos, B_float)  # [s*n, 2, D]
-        BTRB = torch.bmm(B_float.transpose(1, 2), R_B)  # [s*n, D, D]
-        
-        # 重组为 [s, n, D, D]
-        BTRB = BTRB.view(seq_len, -1, BTRB.shape[-2], BTRB.shape[-1])
-        
-        # 高效矩阵乘法替代 einsum
-        x = x.view(batch_size, seq_len, 1, -1)  # [b, s, 1, nh*d]
-        x_expanded = x.unsqueeze(3)  # [b, s, 1, 1, D]
-        result = torch.matmul(x_expanded, BTRB.unsqueeze(0))  # [b, s, 1, 1, D]
-        return result.squeeze(3).squeeze(2).sum(dim=2)  # [b, s, D]
-
-    # ---------------------- 执行流程 ----------------------
-    # 预处理参数
-    B_q_pre = preprocess_B(B_q, num_heads_q)
-    B_k_pre = preprocess_B(B_k, num_heads_k)
-    cos_q = preprocess_cos(cos_size_matrix, num_heads_q)
-    cos_k = preprocess_cos(cos_size_matrix, num_heads_k)
-
-    # 合并多头维度
-    q_concat = q.permute(0, 2, 1, 3).flatten(2)  # [b, s, nh*d]
-    k_concat = k.permute(0, 2, 1, 3).flatten(2)
-
-    # 执行变换
-    q_trans = optimized_transform(q_concat, B_q_pre, cos_q)
-    k_trans = optimized_transform(k_concat, B_k_pre, cos_k)
-
-    # 恢复形状
-    return q_trans.view(batch_size, seq_len, num_heads_q* head_dim), k_trans.view(batch_size, seq_len, num_heads_k* head_dim)
-
-# # 将内部函数提取为静态方法（避免动态闭包影响编译）
-# @torch.compile(dynamic=True, fullgraph=False, mode="max-autotune")
-# def parallel_transform_compiled(
-#     x: torch.Tensor, 
-#     B_blocks: torch.Tensor, 
-#     cos_expanded: torch.Tensor,
-#     num_blocks: int,
-#     D: int
-# ) -> torch.Tensor:
-#     # 批量矩阵计算优化为单一kernel
-#     B_blocks_float = B_blocks.to(x.dtype)
-    
-#     # 转置与矩阵乘法融合
-#     B_rot = torch.bmm(
-#         B_blocks_float.transpose(1,2),  # [s*n, D, 2]
-#         cos_expanded                     # [s*n, 2, 2]
-#     )
-    
-#     # 矩阵链式乘法优化
-#     B_trans = torch.bmm(B_rot, B_blocks_float)  # [s*n, D, D]
-#     B_trans = B_trans.view(-1, num_blocks, D, D)  # [s, n, D, D]
-    
-#     # 替换einsum为广播乘法（编译更友好）
-#     x_trans = (x.unsqueeze(2).to(x.dtype) @ B_trans.permute(0,1,3,2))
-#     return x_trans.squeeze(2)
-
-# def apply_rotary_pos_emb_compiled(q, k, cos_size_matrix, B_q, B_k):
-#     # 静态形状提取（编译时固定）
-#     batch_size, num_heads_q, seq_len, head_dim = q.shape
-#     _, num_heads_k, _, _ = k.shape
-#     head_dim_half = head_dim // 2
-    
-#     # 预计算B和cos的静态参数
-#     B_q_preprocessed = _preprocess_B(B_q, seq_len, num_heads_q, head_dim_half)
-#     B_k_preprocessed = _preprocess_B(B_k, seq_len, num_heads_k, head_dim_half)
-#     cos_q = _preprocess_cos(cos_size_matrix, num_heads_q, head_dim_half)
-#     cos_k = _preprocess_cos(cos_size_matrix, num_heads_k, head_dim_half)
-
-#     # 合并多头维度（保持连续内存布局）
-#     q_concat = q.permute(0,2,1,3).contiguous().view(batch_size, seq_len, -1)
-#     k_concat = k.permute(0,2,1,3).contiguous().view(batch_size, seq_len, -1)
-
-#     # 执行编译优化的核心变换
-#     q_trans = parallel_transform_compiled(
-#         q_concat, B_q_preprocessed, cos_q, 
-#         num_heads_q * head_dim_half, B_q.shape[-1]
-#     )
-#     k_trans = parallel_transform_compiled(
-#         k_concat, B_k_preprocessed, cos_k,
-#         num_heads_k * head_dim_half, B_k.shape[-1]
-#     )
-
-#     # 输出形状重构
-#     return q_trans.view(batch_size, seq_len, num_heads_q* head_dim), k_trans.view(batch_size, seq_len, num_heads_k* head_dim)
-
-# # 预处理器函数（静态参数计算）
-# def _preprocess_B(B: torch.Tensor, seq_len: int, num_heads: int, head_dim_half: int):
-#     num_blocks = num_heads * head_dim_half
-#     B_blocks = B.view(num_blocks, 2, -1)
-#     B_expanded = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1)  # [s, n, 2, D]
-#     return B_expanded.contiguous().view(seq_len * num_blocks, 2, -1)
-
-# def _preprocess_cos(cos: torch.Tensor, num_heads: int, head_dim_half: int):
-#     cos_expanded = cos[:, :head_dim_half].unsqueeze(1)  # [s, 1, 16, 2, 2]
-#     cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1).contiguous()
-#     return cos_expanded.view(cos.size(0), num_heads * head_dim_half, 2, 2).view(-1, 2, 2)
 
 
 class LlamaMLP(nn.Module):
@@ -558,14 +208,14 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
 ):
     key_states = repeat_kv(key, module.num_key_value_groups)
     value_states = repeat_kv(value, module.num_key_value_groups)
@@ -592,13 +242,9 @@ class LlamaAttention(nn.Module):
         self.layer_idx = layer_idx
         self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
-        self.scaling = self.head_dim**-0.5
+        self.scaling = self.head_dim ** -0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
-        self.init = False
-        self.init_B = False
-        # self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
-        # self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -613,167 +259,29 @@ class LlamaAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
-        # new layers
-        self.q_d_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim // 2
-        )
-        self.q_u_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim // 2, config.num_attention_heads * self.head_dim
-        )
-        self.k_d_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads  * self.head_dim // 2
-        )
-        self.k_u_proj = nn.Linear(
-            config.num_key_value_heads * self.head_dim // 2, config.num_key_value_heads * self.head_dim
-        )
-        self.v_d_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim // 2
-        )
-        self.v_u_proj = nn.Linear(
-            config.num_key_value_heads * self.head_dim // 2, config.num_key_value_heads * self.head_dim
-        )
-
-
-    def get_up_down_matrix(self):
-        """
-        对 q_proj、k_proj 分别用SVD分解，然后把分解后的矩阵拷贝到
-         q_d_proj、q_u_proj，以及 k_d_proj、k_u_proj 上。
-        """
-        with torch.no_grad():
-            W_q = self.q_proj.weight.float()  # [384, 384]
-            U_q, S_q, Vh_q = torch.linalg.svd(W_q, full_matrices=False)  # U_q: [384,384], S_q: [384], Vh_q: [384,384]
-
-            r_q = W_q.shape[0]//2
-            U_qr = U_q[:, :r_q]                # [384,192]
-            S_qr = torch.diag(S_q[:r_q])       # [192,192]
-            Vh_qr = Vh_q[:r_q, :]              # [192,384]
-
-            up_q = U_qr
-            down_q = S_qr @ Vh_qr
-
-            # 拷到 q_d_proj, q_u_proj
-            self.q_d_proj.weight.copy_(down_q.to(self.q_proj.weight.dtype))  # q_d_proj.weight -> [192,384]
-            self.q_u_proj.weight.copy_(up_q.to(self.q_proj.weight.dtype))    # q_u_proj.weight -> [384,192]
-
-            W_k = self.k_proj.weight.float()  # [128, 384]
-            U_k, S_k, Vh_k = torch.linalg.svd(W_k, full_matrices=False)  # U_k: [128,128], S_k: [128], Vh_k: [128,384]
-
-            # 取 rank=64
-            r_k = W_k.shape[0]//2
-            U_kr = U_k[:, :r_k]               # [128,64]
-            S_kr = torch.diag(S_k[:r_k])      # [64,64]
-            Vh_kr = Vh_k[:r_k, :]             # [64,384]
-
-            up_k = U_kr
-            down_k = S_kr @ Vh_kr
-
-            # 拷到 k_d_proj, k_u_proj
-            self.k_d_proj.weight.copy_(down_k.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
-            self.k_u_proj.weight.copy_(up_k.to(self.q_proj.weight.dtype))    # k_u_proj.weight -> [128,64]
-
-            W_v = self.v_proj.weight.float()  # [128, 384]
-            U_v, S_v, Vh_v = torch.linalg.svd(W_v, full_matrices=False)  # U_k: [128,128], S_k: [128], Vh_k: [128,384]
-
-            # 取 rank=64
-            r_v = W_v.shape[0]//2
-            U_vr = U_v[:, :r_v]               # [128,64]
-            S_vr = torch.diag(S_v[:r_v])      # [64,64]
-            Vh_vr = Vh_v[:r_v, :]             # [64,384]
-
-            up_v = U_vr
-            down_v = S_vr @ Vh_vr
-
-            # 拷到 k_d_proj, k_u_proj
-            self.v_d_proj.weight.copy_(down_v.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
-            self.v_u_proj.weight.copy_(up_v.to(self.q_proj.weight.dtype))  
-
-    @staticmethod
-    def randomized_svd(A, rank=None, n_iter=5):
-        """
-        使用随机 SVD 分解，提高计算速度：
-        - rank: 目标低秩近似的维度（默认为 X.shape[1]）
-        - n_iter: 迭代次数，控制近似精度
-        """
-        # if not isinstance(X, torch.Tensor):
-        #     raise ValueError(f"Expected a tensor, but got {type(X)}")
-        if rank is None:
-            rank = min(A.shape)  
-        Q_init = torch.randn(A.shape[0], rank, device=A.device, dtype=A.dtype)
-        Q, _ = torch.linalg.qr(Q_init)  
-        B = Q.T @ A  # 低秩投影
-        U, _, V_T = torch.linalg.svd(B.float(), full_matrices=False)
-
-        return V_T.T.to(A.dtype)  # 返回近似的 B 矩阵
-
-    def get_up_cb_matrix_fast(self):
-        """ 使用 Randomized SVD 替代标准 SVD，提高计算速度 """
-        with torch.no_grad():
-            W_q = self.q_u_proj.weight.float()
-            B_q = LlamaAttention.randomized_svd(W_q)  # 近似 B 矩阵
-            W_k = self.k_u_proj.weight.float()
-            B_k = LlamaAttention.randomized_svd(W_k)
-
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
-    
-
-    def get_up_cb_matrix(self):
-        """ input: up_matrix: [32 * config.hidden_size, 64 * config.hidden_size] [32 * 6, 64 * 6]
-            output: C(U): [64 * 6, 64 * 6] 
-                    S(sigma): [64 * 6, 32 * 6]
-                    B(V): [32 * 6, 32 * 6]
-        """
-        with torch.no_grad():
-            W_q = self.q_u_proj.weight.float()
-            C_q, S_q, B_q = torch.linalg.svd(W_q, full_matrices=False)
-            W_k = self.k_u_proj.weight.float()
-            C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
-
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
-
-
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        training: bool = True,
-        **kwargs: Unpack[FlashAttentionKwargs],
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+            attention_mask: Optional[torch.Tensor],
+            past_key_value: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # if torch.all(self.k_u_proj.weight == 0) and training: 
-        if not self.init:
-            self.get_up_down_matrix()
-            self.init=True
+        input_shape = hidden_states.shape[:-1]  # torch.Size([1, 5])
+        hidden_shape = (*input_shape, -1, self.head_dim)  # (1, 5, -1, 64)
 
-        input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
-        hidden_shape = (*input_shape, -1, self.head_dim // 2) # (1, 5, -1, 64)
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # torch.Size([1, 6, 5, 64])
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # torch.Size([1, 2, 5, 64])
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)  # torch.Size([1, 2, 5, 64])
 
-        query_states_h = self.q_d_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
-        key_states_h = self.k_d_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
-        value_states_h = self.v_d_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
-
-        B_q, B_k = self.get_up_cb_matrix()
-        # if not self.init_B:
-        #     B_q, B_k = self.get_up_cb_matrix_fast()
-        #     self.B_q = nn.Parameter(B_q.clone().detach())
-        #     self.B_k = nn.Parameter(B_k.clone().detach())
-        #     self.init = True
-
-        #query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix,B_q,B_k)
-        value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
+        cos, sin = position_embeddings  # ([1, 5, 64], [1, 5, 64])
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"cos_sin_matrix":cos_size_matrix, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states_h, value_states_h, self.layer_idx, cache_kwargs)
-
-        query_states = self.q_u_proj(query_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        key_states = self.k_u_proj(key_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
@@ -813,19 +321,18 @@ class LlamaDecoderLayer(nn.Module):
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        training: bool = True,
-        **kwargs: Unpack[FlashAttentionKwargs],
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_value: Optional[Cache] = None,
+            output_attentions: Optional[bool] = False,
+            use_cache: Optional[bool] = False,
+            cache_position: Optional[torch.LongTensor] = None,
+            position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+            **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        residual = hidden_states # torch.Size([1, 5, 384])
+        residual = hidden_states  # torch.Size([1, 5, 384])
 
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -839,7 +346,6 @@ class LlamaDecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
-            training=training,
             **kwargs,
         )
         hidden_states = residual + hidden_states
@@ -1002,7 +508,6 @@ class LlamaModel(LlamaPreTrainedModel):
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
-        self.my_rotary_emb = LlamaRotaryEmbeddingmy(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -1016,19 +521,18 @@ class LlamaModel(LlamaPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        training: bool = True,
-        **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Cache] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1065,11 +569,11 @@ class LlamaModel(LlamaPreTrainedModel):
             attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
         )
 
-        hidden_states = inputs_embeds #torch.Size([1, 5, 384])
+        hidden_states = inputs_embeds  # torch.Size([1, 5, 384])
 
         # create position embeddings to be shared across the decoder layers
-        # position_embeddings = self.rotary_emb(hidden_states, position_ids) # (torch.Size([1, 5, 64]), torch.Size([1, 5, 64]))
-        position_embeddings = self.my_rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(hidden_states,
+                                              position_ids)  # (torch.Size([1, 5, 64]), torch.Size([1, 5, 64]))
 
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
@@ -1101,7 +605,6 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
-                    training=training,
                     **flash_attn_kwargs,
                 )
 
@@ -1125,12 +628,12 @@ class LlamaModel(LlamaPreTrainedModel):
         return output if return_dict else output.to_tuple()
 
     def _update_causal_mask(
-        self,
-        attention_mask: torch.Tensor,
-        input_tensor: torch.Tensor,
-        cache_position: torch.Tensor,
-        past_key_values: Cache,
-        output_attentions: bool,
+            self,
+            attention_mask: torch.Tensor,
+            input_tensor: torch.Tensor,
+            cache_position: torch.Tensor,
+            past_key_values: Cache,
+            output_attentions: bool,
     ):
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and (attention_mask == 0.0).any():
@@ -1151,10 +654,10 @@ class LlamaModel(LlamaPreTrainedModel):
         # When output attentions is True, sdpa implementation's forward method calls the eager implementation's forward
         if self.config._attn_implementation == "sdpa" and not using_static_cache and not output_attentions:
             if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                is_training=self.training,
+                    attention_mask,
+                    inputs_embeds=input_tensor,
+                    past_key_values_length=past_seen_tokens,
+                    is_training=self.training,
             ):
                 return None
 
@@ -1181,10 +684,10 @@ class LlamaModel(LlamaPreTrainedModel):
         )
 
         if (
-            self.config._attn_implementation == "sdpa"
-            and attention_mask is not None
-            and attention_mask.device.type in ["cuda", "xpu"]
-            and not output_attentions
+                self.config._attn_implementation == "sdpa"
+                and attention_mask is not None
+                and attention_mask.device.type in ["cuda", "xpu"]
+                and not output_attentions
         ):
             # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
             # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
@@ -1196,14 +699,14 @@ class LlamaModel(LlamaPreTrainedModel):
 
     @staticmethod
     def _prepare_4d_causal_attention_mask_with_cache_position(
-        attention_mask: torch.Tensor,
-        sequence_length: int,
-        target_length: int,
-        dtype: torch.dtype,
-        device: torch.device,
-        cache_position: torch.Tensor,
-        batch_size: int,
-        **kwargs,
+            attention_mask: torch.Tensor,
+            sequence_length: int,
+            target_length: int,
+            dtype: torch.dtype,
+            device: torch.device,
+            cache_position: torch.Tensor,
+            batch_size: int,
+            **kwargs,
     ):
         """
         Creates a causal 4D mask of shape `(batch_size, 1, query_length, key_value_length)` from a 2D mask of shape
@@ -1264,8 +767,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = LlamaModel(config)
-        self.vocab_size = config.vocab_size # 49152
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False) # 384, 49152
+        self.vocab_size = config.vocab_size  # 49152
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)  # 384, 49152
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1291,21 +795,20 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
-        training: bool = True,
-        **kwargs: Unpack[KwargsForCausalLM],
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            logits_to_keep: Union[int, torch.Tensor] = 0,
+            **kwargs: Unpack[KwargsForCausalLM],
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1356,7 +859,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
-            training=training,
             **kwargs,
         )
 
@@ -1381,6 +883,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
+
 # __all__ = [
 #     "LlamaForCausalLM",
 #     "LlamaModel",
@@ -1392,7 +895,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
 if __name__ == '__main__':
 
-    from transformers import  AutoTokenizer
+    from transformers import AutoTokenizer
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # model name
     model_name = "AICrossSim/clm-60m"
@@ -1401,32 +905,32 @@ if __name__ == '__main__':
     # 加载 Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token 
-    
-    model = LlamaForCausalLM.from_pretrained(model_name,  ignore_mismatched_sizes=True, torch_dtype=torch.float16).to(device)
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = LlamaForCausalLM.from_pretrained(model_name, ignore_mismatched_sizes=True, torch_dtype=torch.float16).to(
+        device)
 
     input_text = "The future of AI is"
     # input_ids = tokenizer(input_text, return_tensors="pt").input_ids.to(device)
     inputs = tokenizer(
-        input_text, 
-        return_tensors="pt", 
-        padding=True, 
-        truncation=True, 
+        input_text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
         max_length=512,
         return_attention_mask=True
     ).to(device)
-    
+
     output = model.generate(
         inputs.input_ids,
-        attention_mask=inputs.attention_mask, 
-        max_length=50, 
-        do_sample=True, 
-        temperature=0.7, 
-        top_k=50, 
+        attention_mask=inputs.attention_mask,
+        max_length=50,
+        do_sample=True,
+        temperature=0.7,
+        top_k=50,
         eos_token_id=tokenizer.eos_token_id,
-        pad_token_id = tokenizer.pad_token_id,
-        training=True
-    ) # torch.Size([1, 50])
+        pad_token_id=tokenizer.pad_token_id
+    )  # torch.Size([1, 50])
 
     decoded_text = tokenizer.decode(output[0], skip_special_tokens=True)
     print(decoded_text)

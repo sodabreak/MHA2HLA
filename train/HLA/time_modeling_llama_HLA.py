@@ -18,7 +18,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from typing import Callable, List, Optional, Tuple, Union
-
+timings = {}
+from time_measure import time_decorator,record_time
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -49,7 +50,7 @@ from transformers.utils import (
 )
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.models.llama.configuration_llama import LlamaConfig
-
+from transformers import TrainerCallback
 # if is_torch_flex_attn_available():
 #     from torch.nn.attention.flex_attention import BlockMask
 #     from transformers.integrations.flex_attention import make_flex_block_causal_mask
@@ -61,7 +62,14 @@ logger = logging.get_logger(__name__)
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
 _CONFIG_FOR_DOC = "LlamaConfig"
 
-
+class TimingCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        model = kwargs["model"]
+        if hasattr(model, "timings"):
+            print(f"Step {state.global_step} timings:")
+            for name, t in model.timings.items():
+                print(f"{name:<25}: {t:.2f} ms")
+            model.timings.clear()
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -301,7 +309,22 @@ def apply_rotary_pos_emb_hla(q, k, cos_size_matrix, B_q, B_k, position_ids=None,
 
     return q_embed, k_embed
 
-def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
+def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k, timings=None):
+    def record_time(name):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        start.record()
+
+        def stop():
+            end.record()
+            torch.cuda.synchronize()
+            if timings is not None:
+                timings[name] = timings.get(name, 0) + start.elapsed_time(end)
+
+        return stop
+
+    stop_total = record_time("apply_rope_total")
     batch_size, num_heads_q, seq_len, head_dim = q.shape
     _, num_heads_k, _, _ = k.shape
     head_dim_half = head_dim // 2
@@ -309,11 +332,17 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
     total_dim_k = num_heads_k * head_dim
 
     # Merge multi-head dimensions [batch, seq_len, total_dim]
+    # Step 1: reshape q
+    stop_q_reshape = record_time("q_reshape")
     q_concat = q.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_q)
+    stop_q_reshape()
+    # Step 2: reshape k
+    stop_k_reshape = record_time("k_reshape")
     k_concat = k.permute(0, 2, 1, 3).reshape(batch_size, seq_len, total_dim_k)
-
+    stop_k_reshape()
     # Core transformation function
     def parallel_transform(x, B, num_heads, cos_matrix):
+
         # Parameter reorganization
         num_blocks = num_heads * head_dim_half  # Total blocks = num_heads × 16
         
@@ -344,13 +373,22 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
         return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
 
     # Execute transformations
+    stop_q_trans = record_time("q_trans")
     q_transformed = parallel_transform(q_concat, B_q, num_heads_q, cos_size_matrix)
+    stop_q_trans()
+    stop_k_trans = record_time("k_trans")
     k_transformed = parallel_transform(k_concat, B_k, num_heads_k, cos_size_matrix)
+    stop_k_trans()
 
     # Restore original shape [batch, num_heads, seq_len, head_dim]
-    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q* head_dim)
-    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
+    stop_q_restore = record_time("q_restore")
+    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q * head_dim)
+    stop_q_restore()
 
+    stop_k_restore = record_time("k_restore")
+    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k * head_dim)
+    stop_k_restore()
+    stop_total()
     return q_embed, k_embed
 
 def apply_rotary_pos_emb_hla_fast_opt(q, k, cos_size_matrix, B_q, B_k):
@@ -714,77 +752,136 @@ class LlamaAttention(nn.Module):
             B_k = LlamaAttention.randomized_svd(W_k)
 
         return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
-    
 
-    def get_up_cb_matrix(self):
-        """ input: up_matrix: [32 * config.hidden_size, 64 * config.hidden_size] [32 * 6, 64 * 6]
-            output: C(U): [64 * 6, 64 * 6] 
-                    S(sigma): [64 * 6, 32 * 6]
-                    B(V): [32 * 6, 32 * 6]
-        """
+    def get_up_cb_matrix(self, timings = None):
+        """对 q_u_proj 和 k_u_proj 的 weight 做 SVD，并返回 B_q.T 和 B_k.T"""
+
+        def record_time(name):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start.record()
+
+            def stop():
+                end.record()
+                torch.cuda.synchronize()
+                if timings is not None:
+                    timings[name] = start.elapsed_time(end)
+
+            return stop
+
         with torch.no_grad():
+            # --- SVD for q_u_proj ---
+            stop_q_svd = record_time("svd_W_q")
             W_q = self.q_u_proj.weight.float()
             C_q, S_q, B_q = torch.linalg.svd(W_q, full_matrices=False)
+            stop_q_svd()
+
+            # --- SVD for k_u_proj ---
+            stop_k_svd = record_time("svd_W_k")
             W_k = self.k_u_proj.weight.float()
             C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
+            stop_k_svd()
 
         return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
 
-
     def forward(
-        self,
-        hidden_states: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
-        attention_mask: Optional[torch.Tensor],
-        past_key_value: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        training: bool = True,
-        **kwargs: Unpack[FlashAttentionKwargs],
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+            attention_mask: Optional[torch.Tensor],
+            past_key_value: Optional[Cache] = None,
+            cache_position: Optional[torch.LongTensor] = None,
+            training: bool = True,
+            timings: Optional[dict] = None,  # ✅ 接收 timings 字典
+            **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        # if torch.all(self.k_u_proj.weight == 0) and training: 
+
+        def record_time(name):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start.record()
+
+            def stop():
+                end.record()
+                torch.cuda.synchronize()
+                if timings is not None:
+                    timings[name] = start.elapsed_time(end)
+
+            return stop
+
         if not self.init:
             self.get_up_down_matrix()
-            self.init=True
+            self.init = True
 
-        input_shape = hidden_states.shape[:-1] # torch.Size([1, 5])
-        hidden_shape = (*input_shape, -1, self.head_dim // 2) # (1, 5, -1, 64)
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim // 2)
 
-        query_states_h = self.q_d_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 6, 5, 64])
-        key_states_h = self.k_d_proj(hidden_states).view(hidden_shape).transpose(1, 2) # torch.Size([1, 2, 5, 64])
+        # q_d_proj
+        stop_qd = record_time("q_d_proj")
+        query_states_h = self.q_d_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        stop_qd()
+
+        # k_d_proj
+        stop_kd = record_time("k_d_proj")
+        key_states_h = self.k_d_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        stop_kd()
+
+        # v_d_proj
+        stop_vd = record_time("v_d_proj")
         value_states_h = self.v_d_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        stop_vd()
 
-        cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
+        cos_size_matrix = position_embeddings
 
-        B_q, B_k = self.get_up_cb_matrix()
-        # if not self.init_B:
-        #     B_q, B_k = self.get_up_cb_matrix_fast()
-        #     self.B_q = nn.Parameter(B_q.clone().detach())
-        #     self.B_k = nn.Parameter(B_k.clone().detach())
-        #     self.init = True
+        # get B_q / B_k
+        stop_bqbk = record_time("get_up_cb_matrix")
+        B_q, B_k = self.get_up_cb_matrix(timings=timings)
+        stop_bqbk()
 
-        #query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix,B_q,B_k)
-        value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
+        # RoPE
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix, B_q, B_k,timings=timings)
 
+        # v rearrange
+        stop_v_permute = record_time("v_permute_reshape")
+        value_states_h = value_states_h.permute(0, 2, 1, 3).view(*input_shape, -1)
+        stop_v_permute()
+
+        # KV cache
         if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"cos_sin_matrix":cos_size_matrix, "cache_position": cache_position}
+            cache_kwargs = {"cos_sin_matrix": cos_size_matrix, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states_h, value_states_h, self.layer_idx, cache_kwargs)
+        else:
+            key_states = key_states_h
+            value_states = value_states_h
 
-        query_states = self.q_u_proj(query_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        key_states = self.k_u_proj(key_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
+        # q_u_proj
+        stop_qu = record_time("q_u_proj")
+        query_states = self.q_u_proj(query_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0, 2, 1, 3)
+        stop_qu()
+
+        # k_u_proj
+        stop_ku = record_time("k_u_proj")
+        key_states = self.k_u_proj(key_states).view(*input_shape, -1, self.head_dim // 2).permute(0, 2, 1, 3)
+        stop_ku()
+
+        # v_u_proj
+        stop_vu = record_time("v_u_proj")
+        value_states = self.v_u_proj(value_states).view(*input_shape, -1, self.head_dim // 2).permute(0, 2, 1, 3)
+        stop_vu()
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+                    "`scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to eager attention."
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
+        # attention
+        stop_attn = record_time("attention")
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -795,9 +892,14 @@ class LlamaAttention(nn.Module):
             scaling=self.scaling,
             **kwargs,
         )
+        stop_attn()
 
+        # output proj
+        stop_out = record_time("o_proj")
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        stop_out()
+
         return attn_output, attn_weights
 
 
@@ -1343,6 +1445,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        timings = {}
+        kwargs["timings"] = timings
 
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
@@ -1368,7 +1472,11 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
-
+        if timings:
+            print("🕒 Step timing breakdown:")
+            for name, t in timings.items():
+                print(f"{name:<25}: {t:.2f} ms")
+            print(f"{'Total':<25}: {sum(timings.values()):.2f} ms\n")
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
@@ -1425,8 +1533,12 @@ if __name__ == '__main__':
         top_k=50, 
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id = tokenizer.pad_token_id,
-        training=True
+        training=True,
+        timings=timings
     ) # torch.Size([1, 50])
 
     decoded_text = tokenizer.decode(output[0], skip_special_tokens=True)
     print(decoded_text)
+    print("\n🕒 Time Breakdown:")
+    for name, t in timings.items():
+        print(f"{name:20s}: {t:.2f} ms")
