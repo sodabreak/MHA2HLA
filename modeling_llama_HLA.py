@@ -316,7 +316,6 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
     def parallel_transform(x, B, num_heads, cos_matrix):
         # Parameter reorganization
         num_blocks = num_heads * head_dim_half  # Total blocks = num_heads × 16
-        
         # Reorganize B matrix to [seq_len, num_blocks, 2, total_dim]
         B_blocks = B.view(num_blocks, 2, -1)  # [n_blocks, 2, D]
         B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1)  # [s, n_blocks, 2, D]
@@ -348,8 +347,8 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
     k_transformed = parallel_transform(k_concat, B_k, num_heads_k, cos_size_matrix)
 
     # Restore original shape [batch, num_heads, seq_len, head_dim]
-    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q* head_dim)
-    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k* head_dim)
+    q_embed = q_transformed.view(batch_size, seq_len, num_heads_q * head_dim)
+    k_embed = k_transformed.view(batch_size, seq_len, num_heads_k * head_dim)
 
     return q_embed, k_embed
 
@@ -537,7 +536,7 @@ class LlamaAttention(nn.Module):
             W_k = self.k_u_proj.weight.float()
             B_k = LlamaAttention.randomized_svd(W_k)
 
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
+        return B_q.to(self.q_u_proj.weight.dtype), B_k.to(self.q_u_proj.weight.dtype)
     
 
     def get_up_cb_matrix(self):
@@ -552,7 +551,7 @@ class LlamaAttention(nn.Module):
             W_k = self.k_u_proj.weight.float()
             C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
 
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
+        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype), C_q.to(self.q_u_proj.weight.dtype), C_k.to(self.q_u_proj.weight.dtype)
 
 
     def forward(
@@ -579,7 +578,7 @@ class LlamaAttention(nn.Module):
 
         cos_size_matrix = position_embeddings # (self.head_dim // 2, 2,2)
 
-        B_q, B_k = self.get_up_cb_matrix()
+        B_q, B_k, C_q, C_k = self.get_up_cb_matrix()
         # if not self.init_B:
         #     B_q, B_k = self.get_up_cb_matrix_fast()
         #     self.B_q = nn.Parameter(B_q.clone().detach())
@@ -595,9 +594,19 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"cos_sin_matrix":cos_size_matrix, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states_h, value_states_h, self.layer_idx, cache_kwargs)
 
-        query_states = self.q_u_proj(query_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        key_states = self.k_u_proj(key_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
+        # query_states = self.q_u_proj(query_states_h).view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+        # key_states = self.k_u_proj(key_states_h).view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+        query_states = self.q_u_proj(query_states_h)
+        key_states = self.k_u_proj(key_states_h)
+        value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+
+        query_states_u = query_states@C_q
+        key_state_u = key_states@C_k
+
+        query_states[:,:,:query_states_u.shape[2]] = query_states_u
+        key_states[:,:,:key_state_u.shape[2]] = key_state_u
+        query_states = query_states.view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+        key_states = key_states.view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
