@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N llama_train 4gpu
+#PBS -N llama_train_2gpu
 #PBS -l select=1:ncpus=1:mem=64gb:ngpus=2
 #PBS -l walltime=24:00:00
 #PBS -o /rds/general/user/zz4321/home/MHA2HLA/log/${PBS_JOBID}.out
@@ -15,7 +15,7 @@ conda activate MHA2HLA
 # ✅ 2. **定义路径**
 RDS_PROJECTS="/rds/general/user/zz4321/home"
 MODEL_PATH="$RDS_PROJECTS/MHA2HLA"
-MODEL_DIR="$MODEL_PATH/MODEL"
+MODEL_DIR="$MODEL_PATH/MODEL1"
 LOG_PATH="$MODEL_PATH/log"
 RESULTS_PATH="$MODEL_PATH/results"
 
@@ -28,6 +28,6 @@ mkdir -p "$RESULTS_PATH"
 cd "$MODEL_PATH"
 
 # ✅ 5. **运行训练脚本**
-python fine_tuning.py --model_dir "$MODEL_DIR" --epochs 50 --batch_size 6 > "$LOG_PATH/result_${PBS_JOBID}.txt" 2>&1
+python fine_tuning.py --model_dir "$MODEL_DIR" --epochs 50 --batch_size 4 > "$LOG_PATH/result_${PBS_JOBID}.txt" 2>&1
 
 echo "✅ task finished at: $(date)" >> "$LOG_PATH/result_${PBS_JOBID}.txt"

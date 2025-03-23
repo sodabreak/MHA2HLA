@@ -1,13 +1,16 @@
 import os
-import torch
 import argparse
 import pandas as pd
 import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset, DatasetDict, load_from_disk
 from collections import defaultdict
-from modeling_llama import LlamaForCausalLM  # ✅ 从自定义 LLaMA 结构导入
-from transformers import LlamaConfig
+from modeling_llama import LlamaForCausalLM ,LlamaConfig # ✅ 从自定义 LLaMA 结构导入
+import torch
+from transformers import EarlyStoppingCallback
+torch.cuda.empty_cache()
+torch.cuda.ipc_collect()
+
 # ✅ 1. **解析命令行参数**
 parser = argparse.ArgumentParser(description="Load and fine-tune LLaMA model.")
 parser.add_argument("--model_dir", type=str, required=True, help="Path to the model directory.")
@@ -26,41 +29,19 @@ model_path = os.path.join(model_dir, "model.safetensors")
 tokenizer_path = os.path.join(model_dir, "tokenizer.json")
 
 # ✅ 3. **确保模型权重存在**
-if not os.path.exists(model_path):
-    print(f"🔍 Model not found locally in {model_dir}. Downloading from Hugging Face...")
+print(f"🔄 下载模型和 tokenizer：{model_name}")
 
-    # 1️⃣ 从 Hugging Face 下载默认 config
-    config = LlamaConfig.from_pretrained(model_name)
-
-    # 2️⃣ 使用自定义模型架构
-    model = LlamaForCausalLM.from_pretrained(model_name).to(device)
-
-    # 3️⃣ 创建目录 & 保存模型
-    os.makedirs(model_dir, exist_ok=True)
-    model.save_pretrained(model_dir, safe_serialization=True)
-
-else:
-    print(f"✅ Model found locally in {model_dir}. Loading...")
-
-    # 1️⃣ 加载本地 config.json
-    config = LlamaConfig.from_pretrained(model_dir)
-
-    # 2️⃣ 使用自定义架构加载模型
-    model = LlamaForCausalLM.from_pretrained(model_dir, config=config).to(device)
-
-
-# ✅ 4. **确保 Tokenizer 存在**
-if not os.path.exists(tokenizer_path):
-    print(f"🔍 Tokenizer not found locally in {model_dir}. Downloading from Hugging Face...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.save_pretrained(model_dir)
-else:
-    print(f"✅ Tokenizer found locally in {model_dir}. Loading...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-
+config = LlamaConfig.from_pretrained(model_name)
+model = LlamaForCausalLM.from_pretrained(model_name, config=config).to(device)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 # ✅ 5. **确保 Tokenizer 有 `pad_token`**
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+
+os.makedirs(model_dir, exist_ok=True)
+model.save_pretrained(model_dir, safe_serialization=True)
+tokenizer.save_pretrained(model_dir)
+
 
 # ✅ 6. **检查数据集是否存在**
 expected_splits = ["train", "validation", "test"]
@@ -103,6 +84,10 @@ training_args = TrainingArguments(
     push_to_hub=False,
     report_to="none",
     logging_first_step=True,
+    load_best_model_at_end=True,            # 👉 加载验证集最优模型
+    metric_for_best_model="eval_loss",      # 👉 以 eval_loss 为判断标准
+    greater_is_better=False,                # 👉 eval_loss 越低越好
+    save_total_limit=3,                     # 👉 只保留一个最佳模型
 )
 
 # ✅ 9. **训练模型**
@@ -112,6 +97,7 @@ trainer = Trainer(
     train_dataset=tokenized_datasets["train"],
     eval_dataset=tokenized_datasets["validation"],
     tokenizer=tokenizer,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
 )
 
 train_result = trainer.train()
@@ -184,3 +170,4 @@ except Exception as e:
     print(f"❌ 评估失败: {e}")
 
 print("🎉 训练和测试完成！🚀")
+
