@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset, DatasetDict, load_from_disk
 from collections import defaultdict
-from modeling_llama_HLA import LlamaForCausalLM ,LlamaConfig # ✅ 从自定义 LLaMA 结构导入
+from time_modeling_llama_HLA import LlamaForCausalLM ,LlamaConfig # ✅ 从自定义 LLaMA 结构导入
 import torch
 from transformers import EarlyStoppingCallback
 torch.cuda.empty_cache()
