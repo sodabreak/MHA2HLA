@@ -19,7 +19,6 @@
 # limitations under the License.
 from typing import Callable, List, Optional, Tuple, Union
 timings = {}
-from time_measure import time_decorator,record_time
 import torch
 import torch.utils.checkpoint
 from torch import nn
