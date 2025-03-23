@@ -33,7 +33,9 @@ print(f"🔄 下载模型和 tokenizer：{model_name}")
 
 config = LlamaConfig.from_pretrained(model_name)
 model = LlamaForCausalLM.from_pretrained(model_name, config=config).to(device)
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+tokenizer_name = "HuggingFaceTB/cosmo2-tokenizer"
+# 加载 Tokenizer
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 # ✅ 5. **确保 Tokenizer 有 `pad_token`**
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
