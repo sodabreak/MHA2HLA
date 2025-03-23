@@ -499,7 +499,7 @@ class LlamaAttention(nn.Module):
             W_k = self.k_u_proj.weight.float()
             C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
 
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
+        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype), C_q.to(self.q_u_proj.weight.dtype), C_k.to(self.q_u_proj.weight.dtype)
 
 
     def forward(
@@ -525,6 +525,7 @@ class LlamaAttention(nn.Module):
         value_states_h = self.v_d_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         cos, sin = position_embeddings # (self.head_dim // 2, 2,2)
+        B_q, B_k, C_q, C_k = self.get_up_cb_matrix()
 
         query_states_h, key_states_h = apply_rotary_pos_emb(query_states_h, key_states_h, cos, sin)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
@@ -534,9 +535,21 @@ class LlamaAttention(nn.Module):
             cache_kwargs = {"cos":cos, "sin": sin, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states_h, value_states_h, self.layer_idx, cache_kwargs)
 
-        query_states = self.q_u_proj(query_states_h.permute(0,2,1,3).view(*input_shape, -1)).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        key_states = self.k_u_proj(key_states_h.permute(0,2,1,3).view(*input_shape, -1)).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
-        value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
+        # query_states = self.q_u_proj(query_states_h.permute(0,2,1,3).view(*input_shape, -1)).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
+        # key_states = self.k_u_proj(key_states_h.permute(0,2,1,3).view(*input_shape, -1)).view(*input_shape, -1, self.head_dim // 2).permute(0,2,1,3)
+        value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+
+        query_states = self.q_u_proj(query_states_h.permute(0,2,1,3).view(*input_shape, -1))
+        key_states = self.k_u_proj(key_states_h.permute(0,2,1,3).view(*input_shape, -1))
+        # value_states = self.v_u_proj(value_states_h).view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+
+        query_states_u = query_states@C_q
+        key_state_u = key_states@C_k
+
+        query_states[:,:,:query_states_u.shape[2]] = query_states_u
+        key_states[:,:,:key_state_u.shape[2]] = key_state_u
+        query_states = query_states.view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
+        key_states = key_states.view(*input_shape, -1, self.head_dim).permute(0,2,1,3)
 
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
