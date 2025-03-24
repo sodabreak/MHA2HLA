@@ -5,12 +5,9 @@ import matplotlib.pyplot as plt
 from transformers import AutoTokenizer, TrainingArguments, Trainer
 from datasets import load_dataset, DatasetDict, load_from_disk
 from collections import defaultdict
-from modeling_llama_HLA_cache_origin import LlamaForCausalLM ,LlamaConfig # ✅ 从自定义 LLaMA 结构导入
+from time_modeling_llama_HLA import LlamaForCausalLM ,LlamaConfig # ✅ 从自定义 LLaMA 结构导入
 import torch
 from transformers import EarlyStoppingCallback
-from huggingface_hub import snapshot_download
-import shutil
-import json
 torch.cuda.empty_cache()
 torch.cuda.ipc_collect()
 
@@ -38,20 +35,7 @@ config = LlamaConfig.from_pretrained(model_name)
 model = LlamaForCausalLM.from_pretrained(model_name, config=config).to(device)
 tokenizer_name = "HuggingFaceTB/cosmo2-tokenizer"
 # 加载 Tokenizer
-def load_tokenizer_safe(tokenizer_name, cache_dir=None):
-    try:
-        return AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
-    except json.JSONDecodeError as e:
-        print(f"💥 Tokenizer JSON 读取失败: {e}")
-        # 定位路径
-        local_name = tokenizer_name.replace("/", "--")
-        local_cache_path = os.path.expanduser(f"{cache_dir or '~/.cache/huggingface/hub'}/models--{local_name}")
-        print(f"🧹 正在删除损坏的缓存: {local_cache_path}")
-        shutil.rmtree(local_cache_path, ignore_errors=True)
-        print("🔁 重新下载 tokenizer...")
-        return AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
-
-tokenizer = load_tokenizer_safe(tokenizer_name)
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -60,6 +44,7 @@ if tokenizer.pad_token is None:
 os.makedirs(model_dir, exist_ok=True)
 model.save_pretrained(model_dir, safe_serialization=True)
 tokenizer.save_pretrained(model_dir)
+
 
 # ✅ 6. **检查数据集是否存在**
 expected_splits = ["train", "validation", "test"]
@@ -80,8 +65,7 @@ print(f"📂 数据集加载成功：{dataset}")
 
 # ✅ 7. **Tokenization**
 def tokenize_function(examples):
-    tokens = tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512,
-                       return_attention_mask=True)
+    tokens = tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512,return_attention_mask=True)
     tokens["labels"] = tokens["input_ids"].copy()
     return tokens
 

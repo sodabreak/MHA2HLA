@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -N HLA
+#PBS -l select=1:ncpus=1:mem=64gb:ngpus=1
+#PBS -l walltime=48:00:00
+#PBS -o /rds/general/user/zz4321/home/MHA2HLA/log/${PBS_JOBID}.out
+#PBS -e /rds/general/user/zz4321/home/MHA2HLA/log/${PBS_JOBID}.err
+#PBS -j oe
+#PBS -m abe
+# ✅ 设置 HuggingFace 独立缓存目录（基于 SLURM_JOB_ID 或 PBS_JOBID）
+export HF_HOME=$TMPDIR/hf_cache_${PBS_JOBID}
+
+# 可选：显示路径确认
+echo "HuggingFace cache: $HF_HOME"
+
+# ✅ 1. **激活 Conda 环境**
+eval "$(~/miniforge3/bin/conda shell.bash hook)"
+conda config --set auto_activate_base false
+conda activate MHA2HLA
+
+# ✅ 2. **定义路径**
+RDS_PROJECTS="/rds/general/user/zz4321/home"
+MODEL_PATH="$RDS_PROJECTS/MHA2HLA/train/HLA"
+MODEL_DIR="$MODEL_PATH/model"
+LOG_PATH="$MODEL_PATH/log"
+RESULTS_PATH="$MODEL_PATH/results"
+
+# ✅ 3. **确保 `MODEL/``log/` 和 `results/` 目录存在**
+mkdir -p "$MODEL_DIR"
+mkdir -p "$LOG_PATH"
+mkdir -p "$RESULTS_PATH"
+
+# ✅ 4. **切换到工作目录**
+cd "$MODEL_PATH"
+
+# ✅ 5. **运行训练脚本**
+python fine_tuning.py --model_dir "$MODEL_DIR" --epochs 50 --batch_size 4 > "$LOG_PATH/result_${PBS_JOBID}.txt" 2>&1
+
+echo "✅ task finished at: $(date)" >> "$LOG_PATH/result_${PBS_JOBID}.txt"

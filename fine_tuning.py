@@ -35,7 +35,20 @@ config = LlamaConfig.from_pretrained(model_name)
 model = LlamaForCausalLM.from_pretrained(model_name, config=config).to(device)
 tokenizer_name = "HuggingFaceTB/cosmo2-tokenizer"
 # 加载 Tokenizer
-tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+def load_tokenizer_safe(tokenizer_name, cache_dir=None):
+    try:
+        return AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
+    except json.JSONDecodeError as e:
+        print(f"💥 Tokenizer JSON 读取失败: {e}")
+        # 定位路径
+        local_name = tokenizer_name.replace("/", "--")
+        local_cache_path = os.path.expanduser(f"{cache_dir or '~/.cache/huggingface/hub'}/models--{local_name}")
+        print(f"🧹 正在删除损坏的缓存: {local_cache_path}")
+        shutil.rmtree(local_cache_path, ignore_errors=True)
+        print("🔁 重新下载 tokenizer...")
+        return AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
+
+tokenizer = load_tokenizer_safe(tokenizer_name)
 # ✅ 5. **确保 Tokenizer 有 `pad_token`**
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -64,7 +77,7 @@ print(f"📂 数据集加载成功：{dataset}")
 
 # ✅ 7. **Tokenization**
 def tokenize_function(examples):
-    tokens = tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512)
+    tokens = tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512,return_attention_mask=True)
     tokens["labels"] = tokens["input_ids"].copy()
     return tokens
 

@@ -32,8 +32,11 @@ git push commit origin
 
 this allow a test before push
 ## Google drive containing models
-https://drive.google.com/drive/folders/1cg_nFA9tmdDLZJ7h3oUyqO-vubNTQHLP?usp=sharing
-5 epoch training on wikitext-2-v1 
+#https://drive.google.com/drive/folders/1cg_nFA9tmdDLZJ7h3oUyqO-vubNTQHLP?usp=sharing
+5 epoch training on wikitext-2-v1 （forbidden This one has stopped used)(wrong tokeniser and useless)
+
+7 epoch(best),8 epoch,9 epoch origin:
+https://drive.google.com/drive/folders/105usjkc0ZiZjhLqxZFPmo9dBHafRnJH1?usp=sharing
 
 
 ## Achievements:
