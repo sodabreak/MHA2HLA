@@ -727,7 +727,7 @@ class LlamaAttention(nn.Module):
             W_k = self.k_u_proj.weight.float()
             C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
 
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype), C_q.to(self.q_u_proj.weight.dtype), C_k.to(self.q_u_proj.weight.dtype)
+        return B_q.to(self.q_u_proj.weight.dtype), B_k.to(self.q_u_proj.weight.dtype), C_q.to(self.q_u_proj.weight.dtype), C_k.to(self.q_u_proj.weight.dtype)
 
 
     def forward(
@@ -762,7 +762,7 @@ class LlamaAttention(nn.Module):
         #     self.init = True
 
         # query_states_h, key_states_h = apply_rotary_pos_emb_hla(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
-        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix,B_q,B_k)
+        query_states_h, key_states_h = apply_rotary_pos_emb_hla_fast(query_states_h, key_states_h, cos_size_matrix, B_q, B_k)
         value_states_h = value_states_h.permute(0,2,1,3).view(*input_shape, -1)
 
         if past_key_value is not None:

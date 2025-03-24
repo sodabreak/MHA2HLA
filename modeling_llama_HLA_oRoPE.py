@@ -484,7 +484,7 @@ class LlamaAttention(nn.Module):
             W_k = self.k_u_proj.weight.float()
             B_k = LlamaAttention.randomized_svd(W_k)
 
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype)
+        return B_q.to(self.q_u_proj.weight.dtype), B_k.to(self.q_u_proj.weight.dtype)
     
 
     def get_up_cb_matrix(self):
@@ -499,7 +499,7 @@ class LlamaAttention(nn.Module):
             W_k = self.k_u_proj.weight.float()
             C_k, S_k, B_k = torch.linalg.svd(W_k, full_matrices=False)
 
-        return B_q.T.to(self.q_u_proj.weight.dtype), B_k.T.to(self.q_u_proj.weight.dtype), C_q.to(self.q_u_proj.weight.dtype), C_k.to(self.q_u_proj.weight.dtype)
+        return B_q.to(self.q_u_proj.weight.dtype), B_k.to(self.q_u_proj.weight.dtype), C_q.to(self.q_u_proj.weight.dtype), C_k.to(self.q_u_proj.weight.dtype)
 
 
     def forward(
