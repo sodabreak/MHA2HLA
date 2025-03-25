@@ -198,11 +198,11 @@ class LlamaRotaryEmbeddingmy(nn.Module):
         sin = sin * self.attention_scaling
 
         # 变换为旋转矩阵形式 `[seq_len, head_dim//2, 2, 2]`
-        rope_matrix = torch.zeros((cos.shape[1], cos.shape[2], 2, 2), device=cos.device, dtype=cos.dtype)
-        rope_matrix[..., 0, 0] = cos.squeeze(0)  # cos(θ)
-        rope_matrix[..., 0, 1] = -sin.squeeze(0)  # -sin(θ)
-        rope_matrix[..., 1, 0] = sin.squeeze(0)  # sin(θ)
-        rope_matrix[..., 1, 1] = cos.squeeze(0)  # cos(θ)
+        rope_matrix = torch.zeros((cos.shape[0],cos.shape[1], cos.shape[2], 2, 2), device=cos.device, dtype=cos.dtype)
+        rope_matrix[..., 0, 0] = cos[:,:,:] # cos(θ)
+        rope_matrix[..., 0, 1] = -sin[:,:,:]  # -sin(θ)
+        rope_matrix[..., 1, 0] = sin[:,:,:]   # sin(θ)
+        rope_matrix[..., 1, 1] = cos[:,:,:]
 
         return rope_matrix  # [seq_len, head_dim//2, 2, 2]
 
@@ -334,34 +334,32 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k, timings=None)
     stop_k_reshape()
     # Core transformation function
     def parallel_transform(x, B, num_heads, cos_matrix):
-
         # Parameter reorganization
         num_blocks = num_heads * head_dim_half  # Total blocks = num_heads × 16
-        
         # Reorganize B matrix to [seq_len, num_blocks, 2, total_dim]
         B_blocks = B.view(num_blocks, 2, -1)  # [n_blocks, 2, D]
-        B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1).to(torch.float32)  # [s, n_blocks, 2, D]
+        B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1) # [s, n_blocks, 2, D]
         
         # Expand cos matrix to [seq_len, num_blocks, 2, 2]
-        cos_expanded = cos_matrix[:, :head_dim_half]  # [s, 16, 2, 2]
-        cos_expanded = cos_expanded.unsqueeze(1)  # [s, 1, 16, 2, 2]
-        cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1)  # [s, nh, 16, 2, 2]
-        cos_expanded = cos_expanded.reshape(seq_len, num_blocks, 2, 2)  # [s, n_blocks, 2, 2]
+        cos_expanded = cos_matrix[:, :, :, :head_dim_half]  # [s, 16, 2, 2]
+        cos_expanded = cos_expanded.unsqueeze(2)  # [s, 1, 16, 2, 2]
+        cos_expanded = cos_expanded.expand(cos_expanded.shape[0],-1, num_heads, -1, -1, -1)  # [s, nh, 16, 2, 2]
+        cos_expanded = cos_expanded.reshape(cos_expanded.shape[0],seq_len, num_blocks, 2, 2)  # [s, n_blocks, 2, 2]
+        B_blocks_expanded = B_blocks.unsqueeze(0).expand(cos_expanded.shape[0], -1, -1, -1, -1)
 
         # Calculate B'R [s, n_blocks, D, 2]
-        B_rot = torch.einsum('snij,snjk->snik', 
-                            B_blocks.transpose(2,3),  # [s,n_blocks,D,2]
-                            cos_expanded)              # [s,n_blocks,2,2]
+        B_rot = torch.einsum('bsndr,bsnrl->bsndl',
+                     B_blocks_expanded.transpose(3, 4),  # [1, 5, 96, 192, 2]
+                     cos_expanded.to(torch.float16))     # [1, 5, 96, 2, 2]
         
         # Calculate (B'R)B [s, n_blocks, D, D]
-        B_trans = torch.einsum('snik,snkj->snij',  # Key dimension alignment fix
-                             B_rot,                # [s,n_blocks,D,2]
-                             B_blocks)  # [s,n_blocks,2,D]
+        B_trans = torch.einsum('bsndk,bsnkl->bsndl', B_rot, B_blocks_expanded)
+
         
         # Apply transformation and accumulate [batch, seq_len, D]
-        x_trans = torch.einsum('bsd,snij->bsnj', 
+        x_trans = torch.einsum('bsd,bsnij->bsnj', 
                               x,  # [batch, s, D]
-                              B_trans)              # [s,n_blocks,D,D]
+                              B_trans)           # [batch, s,n_blocks,D,D]
         return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
 
     # Execute transformations
@@ -1488,7 +1486,7 @@ if __name__ == '__main__':
     from transformers import  AutoTokenizer
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # model name
-    model_name = "AICrossSim/clm-60m"
+    model_name = r"E:\MSC\Spring\Advanced deep learning system\checkpoint-56252"
     tokenizer_name = "HuggingFaceTB/cosmo2-tokenizer"
 
     # 加载 Tokenizer
