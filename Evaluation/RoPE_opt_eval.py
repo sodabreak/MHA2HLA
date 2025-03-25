@@ -4,7 +4,159 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 from transformers import AutoTokenizer, LlamaConfig
-from modeling_llama_HLA import LlamaRotaryEmbeddingmy, LlamaRotaryEmbedding, apply_rotary_pos_emb
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+class LlamaRotaryEmbedding(nn.Module):
+    def __init__(self, config: LlamaConfig, device=None):
+        super().__init__()
+        # BC: "rope_type" was originally "type"
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            # This .to() is needed if the model has been moved to a device after being initialized (because
+            # the buffer is automatically moved, but not the original copy)
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+class LlamaRotaryEmbeddingmy(nn.Module):
+    def __init__(self, config, device=None):
+        super().__init__()
+        if hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+            self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        else:
+            self.rope_type = "default"
+
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+        self.config = config
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
+        inv_freq = inv_freq[: inv_freq.shape[0] // 2]
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:
+            inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, seq_len=seq_len)
+            inv_freq = inv_freq[: inv_freq.shape[0] // 2]
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:
+            self.original_inv_freq = self.original_inv_freq.to(device)
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # 计算 RoPE 角度
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
+            # emb = torch.cat((freqs, freqs), dim=-1)
+            cos = freqs.cos()  # 形状: [batch_size, seq_len, head_dim//2]
+            sin = freqs.sin()  # 形状: [batch_size, seq_len, head_dim//2]
+
+        # 应用 RoPE 位置缩放
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        # 变换为旋转矩阵形式 `[seq_len, head_dim//2, 2, 2]`
+        rope_matrix = torch.zeros((cos.shape[0],cos.shape[1], cos.shape[2], 2, 2), device=cos.device, dtype=cos.dtype)
+        rope_matrix[..., 0, 0] = cos[:,:,:] # cos(θ)
+        rope_matrix[..., 0, 1] = -sin[:,:,:]  # -sin(θ)
+        rope_matrix[..., 1, 0] = sin[:,:,:]   # sin(θ)
+        rope_matrix[..., 1, 1] = cos[:,:,:] 
+
+        return rope_matrix  # [seq_len, head_dim//2, 2, 2]
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
     batch_size, num_heads_q, seq_len, head_dim = q.shape
     _, num_heads_k, _, _ = k.shape
@@ -25,25 +177,25 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
         B_blocks = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1) # [s, n_blocks, 2, D]
         
         # Expand cos matrix to [seq_len, num_blocks, 2, 2]
-        cos_expanded = cos_matrix[:, :head_dim_half]  # [s, 16, 2, 2]
-        cos_expanded = cos_expanded.unsqueeze(1)  # [s, 1, 16, 2, 2]
-        cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1)  # [s, nh, 16, 2, 2]
-        cos_expanded = cos_expanded.reshape(seq_len, num_blocks, 2, 2)  # [s, n_blocks, 2, 2]
+        cos_expanded = cos_matrix[:, :, :, :head_dim_half]  # [s, 16, 2, 2]
+        cos_expanded = cos_expanded.unsqueeze(2)  # [s, 1, 16, 2, 2]
+        cos_expanded = cos_expanded.expand(cos_expanded.shape[0],-1, num_heads, -1, -1, -1)  # [s, nh, 16, 2, 2]
+        cos_expanded = cos_expanded.reshape(cos_expanded.shape[0],seq_len, num_blocks, 2, 2)  # [s, n_blocks, 2, 2]
+        B_blocks_expanded = B_blocks.unsqueeze(0).expand(cos_expanded.shape[0], -1, -1, -1, -1)
 
         # Calculate B'R [s, n_blocks, D, 2]
-        B_rot = torch.einsum('snij,snjk->snik', 
-                            B_blocks.transpose(2,3),  # [s,n_blocks,D,2]
-                            cos_expanded)              # [s,n_blocks,2,2]
+        B_rot = torch.einsum('bsndr,bsnrl->bsndl',
+                     B_blocks_expanded.transpose(3, 4),  # [1, 5, 96, 192, 2]
+                     cos_expanded.to(torch.float32))     # [1, 5, 96, 2, 2]
         
         # Calculate (B'R)B [s, n_blocks, D, D]
-        B_trans = torch.einsum('snik,snkj->snij',  # Key dimension alignment fix
-                             B_rot,                # [s,n_blocks,D,2]
-                             B_blocks)  # [s,n_blocks,2,D]
+        B_trans = torch.einsum('bsndk,bsnkl->bsndl', B_rot, B_blocks_expanded)
+
         
         # Apply transformation and accumulate [batch, seq_len, D]
-        x_trans = torch.einsum('bsd,snij->bsnj', 
+        x_trans = torch.einsum('bsd,bsnij->bsnj', 
                               x,  # [batch, s, D]
-                              B_trans)              # [s,n_blocks,D,D]
+                              B_trans)           # [batch, s,n_blocks,D,D]
         return x_trans.sum(dim=2).to(x.dtype)       # Sum along block dimension
 
     # Execute transformations
@@ -54,7 +206,7 @@ def apply_rotary_pos_emb_hla_fast(q, k, cos_size_matrix, B_q, B_k):
     q_embed = q_transformed.view(batch_size, seq_len, num_heads_q * head_dim)
     k_embed = k_transformed.view(batch_size, seq_len, num_heads_k * head_dim)
 
-    return q_embed, k_embed
+    return q_embed, k_embed 
 class RoPEBenchmark:
     def __init__(self, model_name="AICrossSim/clm-60m", tokenizer_name="HuggingFaceTB/cosmo2-tokenizer"):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -260,7 +412,7 @@ def main():
     print("\nRunning benchmarks...")
     results = benchmark.run_benchmark(
         batch_sizes=[1, 4, 8],
-        seq_lengths=[128, 512, 1024, 2048],
+        seq_lengths=[32, 64, 128, 256],
         n_iterations=5
     )
 
