@@ -35,8 +35,10 @@ this allow a test before push
 
 7 epoch(best),8 epoch,9 epoch origin:
 https://drive.google.com/drive/folders/105usjkc0ZiZjhLqxZFPmo9dBHafRnJH1?usp=sharing
-HLA_orope (the lowest validation cost is 18 epoch (recorded in the google drive))
+HLA_orope (the lowest validation cost is 18 epoch (training and test jupyter notebook is inside the google drive)
 https://drive.google.com/drive/folders/1UNUGjmVJyrsqFIp6Vn-Sx4KfkrB0WGX9?usp=sharing
+HLA: Choose the smaller step one(training and test jupyter notebook is inside the google drive)
+https://drive.google.com/drive/folders/1tItskPkZejRLY606_ZEvusaWz2T2SQiw?usp=drive_link
 ## Achievements:
 - Prove:
     - Prove the math of transforming the RoPE to latent space to save the cache space and computaional time. 
