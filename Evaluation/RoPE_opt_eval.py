@@ -108,7 +108,7 @@ class RoPEBenchmark:
             q_embed_orig, k_embed_orig = apply_rotary_pos_emb(q, k, cos_orig, sin_orig)
 
             # New implementation
-            cos_size_matrix = self.rope_new(q, position_ids)
+            cos_size_matrix = self.rope_new(q_l, position_ids)
             q_embed_new, k_embed_new = apply_rotary_pos_emb_hla_fast(q_l, k_l, cos_size_matrix, self.B_q, self.B_k)
 
         # Benchmark original implementation
@@ -124,7 +124,7 @@ class RoPEBenchmark:
         torch.cuda.synchronize() if self.device == "cuda" else None
         start_time = time.time()
         for _ in range(n_iterations):
-            cos_size_matrix = self.rope_new(q, position_ids)
+            cos_size_matrix = self.rope_new(q_l, position_ids)
             q_embed_new, k_embed_new = apply_rotary_pos_emb_hla_fast(q_l, k_l, cos_size_matrix, self.B_q, self.B_k)
             torch.cuda.synchronize() if self.device == "cuda" else None
         new_time = (time.time() - start_time) / n_iterations
@@ -136,7 +136,7 @@ class RoPEBenchmark:
         orig_memory = torch.cuda.max_memory_allocated() / 1024**2 if self.device == "cuda" else 0
 
         torch.cuda.reset_peak_memory_stats() if self.device == "cuda" else None
-        cos_size_matrix = self.rope_new(q, position_ids)
+        cos_size_matrix = self.rope_new(q_l, position_ids)
         q_embed_new, k_embed_new = apply_rotary_pos_emb_hla_fast(q_l, k_l, cos_size_matrix, self.B_q, self.B_k)
         new_memory = torch.cuda.max_memory_allocated() / 1024**2 if self.device == "cuda" else 0
 
@@ -175,7 +175,7 @@ class RoPEBenchmark:
         q_embed_orig, k_embed_orig = apply_rotary_pos_emb(q, k, cos_orig, sin_orig)
 
         # New implementation
-        cos_size_matrix = self.rope_new(q, position_ids)
+        cos_size_matrix = self.rope_new(q_l, position_ids)
         q_embed_new, k_embed_new = apply_rotary_pos_emb_hla_fast(q_l, k_l, cos_size_matrix, self.B_q, self.B_k)
 
         # Reshape new outputs to match original shape
