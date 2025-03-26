@@ -1,4 +1,4 @@
-# MHA2HLA
+<!-- # MHA2HLA
 
 
 [llama](https://github.com/huggingface/transformers/tree/main/src/transformers/models/llama)
@@ -11,27 +11,11 @@
 
 [later you may want to use a subset of fineweb to finetune the transformed model and cross validate on wikitext2.](https://huggingface.co/datasets/HuggingFaceFW/fineweb)
 
-# Traing test list:
-- With / without frozen qkv_proj 
-- recover upscale with / without latent
-- inference with original / changed S code (inference的时候啥时候用到了S？好像没用到？)
-- try model 60m/200m
-  
-to be continued...
-add-test-workflow
-change PR rule
+# Language Model Training and Evaluation -->
+---
+## HLA-RoPE
 
-## to start a PR
-git checkout -b newbranch
-
-git add .
-
-git commit -m "pr"
-
-git push commit origin
-
-this allow a test before push
-# Language Model Training and Evaluation
+The model enables the RoPE process on the latent space thus saving the memory in cache.
 
 ## 🏋️‍♂️ Training
 
@@ -75,7 +59,8 @@ Each experiment includes:
 
 ---
 
-Feel free to open an issue if you have questions about using the checkpoints or running training.
+
+<!-- Feel free to open an issue if you have questions about using the checkpoints or running training. -->
 
 ## Achievements:
 - Prove:
@@ -88,11 +73,3 @@ Feel free to open an issue if you have questions about using the checkpoints or 
         - apply down-scale matrix to hidden_state to get the C(latent) state.
         - apply SVD to up-scale matrix to get the B matrix, and compute RoPE to C(latent) state.
         - cache key_states_h and queue_states_h
-        - apply up-scale matrix to recover to original dimention to compute attenntion.
-
-## TODO
-- 1. finetune the original model to see the baseline
-- 2. solve the problem of SVD: the computation of SVD is slow
-    - set B matrix as learnable parameters
-    - use fast SVD 
-- 3. finish training lists as Above to see the influence
