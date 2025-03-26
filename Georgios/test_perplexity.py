@@ -72,7 +72,11 @@ def eval(
         model = transform_model_to_MLA(model, transform_config)
     # # move the model to GPU
     model.to(device)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer_name = "HuggingFaceTB/cosmo2-tokenizer"
+
+    # 加载 Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     # *: wrap the model with HFLM API
     model = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=batch_size, max_length=max_seq_len)
 
