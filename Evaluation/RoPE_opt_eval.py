@@ -421,7 +421,7 @@ def main():
 
     # Print summary
     print("\nSummary:")
-    for batch_size in [1]:
+    for batch_size in [1, 4, 8]:
         for seq_len in [32, 64, 128, 256]:
             result = next((r for r in results if r["batch_size"] == batch_size and r["seq_len"] == seq_len), None)
             if result:
