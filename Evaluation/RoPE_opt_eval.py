@@ -422,7 +422,7 @@ def main():
     # Print summary
     print("\nSummary:")
     for batch_size in [1]:
-        for seq_len in [128, 512, 1024, 2048]:
+        for seq_len in [32, 64, 128, 256]:
             result = next((r for r in results if r["batch_size"] == batch_size and r["seq_len"] == seq_len), None)
             if result:
                 print(f"Batch={batch_size}, Seq={seq_len}: Speedup={result['speedup']:.2f}x, Memory={result['memory_ratio']:.2f}x")
