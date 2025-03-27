@@ -63,7 +63,7 @@ expected_splits = ["train", "validation", "test"]
 if all(os.path.exists(os.path.join(dataset_path, split)) for split in expected_splits):
     print(f"📂 发现本地数据集 {dataset_path}，正在加载...")
     dataset = DatasetDict({
-        "train": load_from_disk(os.path.join(dataset_path, "train")),
+        "train": load_from_disk(os.path.join(dataset_path, "../train")),
         "validation": load_from_disk(os.path.join(dataset_path, "validation")),
         "test": load_from_disk(os.path.join(dataset_path, "test"))
     })
