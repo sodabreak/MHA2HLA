@@ -45,7 +45,6 @@ RoPE.
 """
 
 
-This version focuses on reducing memory usage with some trade-offs in speed. Let me know if you need further modifications or clarifications!
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
