@@ -17,6 +17,35 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+""" 
+This version of the code modifies the LLaMA 3 model by mapping the `hidden_state` 
+into a latent space while still using the original high-dimensional RoPE 
+(Rotary Position Embedding). The expected outcome is a reduction in memory cache
+usage, but at the cost of potentially slower performance due to the higher dimensionality 
+of the RoPE.
+
+### Key Changes:
+1. Mapping to Latent Space: The `hidden_state` is projected into a lower-dimensional 
+latent space before applying the attention mechanism. This transformation reduces 
+the intermediate state dimensions, which helps decrease the memory usage.
+
+2. Original RoPE: The original, high-dimensional RoPE is applied, which maintains 
+the full range of position embeddings. While this keeps the model's expressive 
+power intact, it might result in increased computation time and memory requirements compared to the low-dimensional RoPE.
+
+3. Reduced Cache Usage, Reduced Speed: The use of latent space mapping reduces the 
+cache size, but since the original RoPE is still used, the computational cost increases, 
+leading to potential slowdowns in training or inference speed.
+
+The implementation is aimed at optimizing memory usage by reducing the cache size but 
+comes with a trade-off in terms of speed due to the use of the original, high-dimensional 
+RoPE.
+"""
+
+
+This version focuses on reducing memory usage with some trade-offs in speed. Let me know if you need further modifications or clarifications!
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -407,8 +436,8 @@ class LlamaAttention(nn.Module):
 
     def get_up_down_matrix(self):
         """
-        对 q_proj、k_proj 分别用SVD分解，然后把分解后的矩阵拷贝到
-         q_d_proj、q_u_proj，以及 k_d_proj、k_u_proj 上。
+        Perform SVD decomposition on `q_proj` and `k_proj` separately, and then copy the decomposed matrices to
+        `q_d_proj`, `q_u_proj`, as well as `k_d_proj`, `k_u_proj`.
         """
         with torch.no_grad():
             W_q = self.q_proj.weight.float()  # [384, 384]
@@ -422,14 +451,14 @@ class LlamaAttention(nn.Module):
             up_q = U_qr
             down_q = S_qr @ Vh_qr
 
-            # 拷到 q_d_proj, q_u_proj
+            # Copy to `q_d_proj`, `q_u_proj`
             self.q_d_proj.weight.copy_(down_q.to(self.q_proj.weight.dtype))  # q_d_proj.weight -> [192,384]
             self.q_u_proj.weight.copy_(up_q.to(self.q_proj.weight.dtype))    # q_u_proj.weight -> [384,192]
 
             W_k = self.k_proj.weight.float()  # [128, 384]
             U_k, S_k, Vh_k = torch.linalg.svd(W_k, full_matrices=False)  # U_k: [128,128], S_k: [128], Vh_k: [128,384]
 
-            # 取 rank=64
+            # Take rank=64
             r_k = W_k.shape[0]//2
             U_kr = U_k[:, :r_k]               # [128,64]
             S_kr = torch.diag(S_k[:r_k])      # [64,64]
@@ -438,14 +467,14 @@ class LlamaAttention(nn.Module):
             up_k = U_kr
             down_k = S_kr @ Vh_kr
 
-            # 拷到 k_d_proj, k_u_proj
+            # Copy to `k_d_proj`, `k_u_proj`
             self.k_d_proj.weight.copy_(down_k.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
             self.k_u_proj.weight.copy_(up_k.to(self.q_proj.weight.dtype))    # k_u_proj.weight -> [128,64]
 
             W_v = self.v_proj.weight.float()  # [128, 384]
             U_v, S_v, Vh_v = torch.linalg.svd(W_v, full_matrices=False)  # U_k: [128,128], S_k: [128], Vh_k: [128,384]
 
-            # 取 rank=64
+            # Take rank=64
             r_v = W_v.shape[0]//2
             U_vr = U_v[:, :r_v]               # [128,64]
             S_vr = torch.diag(S_v[:r_v])      # [64,64]
@@ -454,16 +483,17 @@ class LlamaAttention(nn.Module):
             up_v = U_vr
             down_v = S_vr @ Vh_vr
 
-            # 拷到 k_d_proj, k_u_proj
+            # Copy to `v_d_proj`, `v_u_proj`
             self.v_d_proj.weight.copy_(down_v.to(self.q_proj.weight.dtype))  # k_d_proj.weight -> [64,384]
-            self.v_u_proj.weight.copy_(up_v.to(self.q_proj.weight.dtype))  
+            self.v_u_proj.weight.copy_(up_v.to(self.q_proj.weight.dtype))    # v_u_proj.weight -> [128,64]
+
 
     @staticmethod
     def randomized_svd(A, rank=None, n_iter=5):
         """
-        使用随机 SVD 分解，提高计算速度：
-        - rank: 目标低秩近似的维度（默认为 X.shape[1]）
-        - n_iter: 迭代次数，控制近似精度
+        Performs randomized SVD decomposition to improve computation speed:
+        - rank: The target rank for the low-rank approximation (defaults to X.shape[1])
+        - n_iter: The number of iterations to control the approximation accuracy
         """
         # if not isinstance(X, torch.Tensor):
         #     raise ValueError(f"Expected a tensor, but got {type(X)}")
@@ -471,20 +501,22 @@ class LlamaAttention(nn.Module):
             rank = min(A.shape)  
         Q_init = torch.randn(A.shape[0], rank, device=A.device, dtype=A.dtype)
         Q, _ = torch.linalg.qr(Q_init)  
-        B = Q.T @ A  # 低秩投影
+        B = Q.T @ A  # Low-rank projection
         U, _, V_T = torch.linalg.svd(B.float(), full_matrices=False)
 
-        return V_T.T.to(A.dtype)  # 返回近似的 B 矩阵
+        return V_T.T.to(A.dtype)  # Return the approximate B matrix
+
 
     def get_up_cb_matrix_fast(self):
-        """ 使用 Randomized SVD 替代标准 SVD，提高计算速度 """
+        """ Use Randomized SVD instead of standard SVD to improve computation speed """
         with torch.no_grad():
             W_q = self.q_u_proj.weight.float()
-            B_q = LlamaAttention.randomized_svd(W_q)  # 近似 B 矩阵
+            B_q = LlamaAttention.randomized_svd(W_q)  # Approximate B matrix
             W_k = self.k_u_proj.weight.float()
             B_k = LlamaAttention.randomized_svd(W_k)
 
         return B_q.to(self.q_u_proj.weight.dtype), B_k.to(self.q_u_proj.weight.dtype)
+
     
 
     def get_up_cb_matrix(self):

@@ -17,6 +17,31 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+
+
+
+""" This code modifies the LLaMA 3 model to map the `hidden_state` 
+into a latent space and then applies low-dimensional RoPE (Rotary Position Embedding). 
+The purpose of these changes is to reduce memory cache usage, which can lead to improved 
+computational efficiency. 
+
+### Key Changes:
+1. Mapping to Latent Space: The `hidden_state` is projected into a lower-dimensional 
+latent space before further processing. This helps reduce the dimensionality of the 
+intermediate representations, saving memory and enhancing performance.
+   
+2. Low-dimensional RoPE: Instead of using the standard high-dimensional RoPE, a 
+lower-dimensional RoPE is applied. This further reduces the computational and memory 
+overhead during the attention mechanism, particularly beneficial for large models.
+
+3. Reduced Cache Usage: By using a low-dimensional RoPE and mapping to the latent 
+space, the memory footprint is minimized, which reduces the cache requirements during 
+training and inference.
+
+The implementation aims to optimize the model's performance and memory efficiency,
+making it more scalable for larger datasets or limited hardware resources.
+ """
 from typing import Callable, List, Optional, Tuple, Union
 
 import torch
@@ -181,7 +206,7 @@ class LlamaRotaryEmbeddingmy(nn.Module):
         if "dynamic" in self.rope_type:
             self._dynamic_frequency_update(position_ids, device=x.device)
 
-        # 计算 RoPE 角度
+        # compute RoPE 
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 
@@ -190,8 +215,8 @@ class LlamaRotaryEmbeddingmy(nn.Module):
         with torch.autocast(device_type=device_type, enabled=False):
             freqs = (inv_freq_expanded.float().to(x.device) @ position_ids_expanded.float()).transpose(1, 2)
             # emb = torch.cat((freqs, freqs), dim=-1)
-            cos = freqs.cos()  # 形状: [batch_size, seq_len, head_dim//2]
-            sin = freqs.sin()  # 形状: [batch_size, seq_len, head_dim//2]
+            cos = freqs.cos()  # batch: [batch_size, seq_len, head_dim//2]
+            sin = freqs.sin()  # batch: [batch_size, seq_len, head_dim//2]
 
         # Apply RoPE position scaling
         cos = cos * self.attention_scaling
@@ -199,10 +224,6 @@ class LlamaRotaryEmbeddingmy(nn.Module):
 
         # Transform to the form of a rotation matrix `[seq_len, head_dim//2, 2, 2]`
         rope_matrix = torch.zeros((cos.shape[0],cos.shape[1], cos.shape[2], 2, 2), device=cos.device, dtype=cos.dtype)
-        # rope_matrix[..., 0, 0] = cos.squeeze(0)  # cos(θ)
-        # rope_matrix[..., 0, 1] = -sin.squeeze(0)  # -sin(θ)
-        # rope_matrix[..., 1, 0] = sin.squeeze(0)  # sin(θ)
-        # rope_matrix[..., 1, 1] = cos.squeeze(0)  # cos(θ)
         rope_matrix[..., 0, 0] = cos[:,:,:] # cos(θ)
         rope_matrix[..., 0, 1] = -sin[:,:,:]  # -sin(θ)
         rope_matrix[..., 1, 0] = sin[:,:,:]   # sin(θ)
@@ -464,72 +485,6 @@ def apply_rotary_pos_emb_hla_fast_opt_v2(q, k, cos_size_matrix, B_q, B_k):
     # restore shape
     return q_trans.view(batch_size, seq_len, num_heads_q* head_dim), k_trans.view(batch_size, seq_len, num_heads_k* head_dim)
 
-# Extract internal functions as static methods (to avoid compilation errors caused by dynamic closures)
-# @torch.compile(dynamic=True, fullgraph=False, mode="max-autotune")
-# def parallel_transform_compiled(
-#     x: torch.Tensor, 
-#     B_blocks: torch.Tensor, 
-#     cos_expanded: torch.Tensor,
-#     num_blocks: int,
-#     D: int
-# ) -> torch.Tensor:
-#     # 批量矩阵计算优化为单一kernel
-#     B_blocks_float = B_blocks.to(x.dtype)
-    
-#     # 转置与矩阵乘法融合
-#     B_rot = torch.bmm(
-#         B_blocks_float.transpose(1,2),  # [s*n, D, 2]
-#         cos_expanded                     # [s*n, 2, 2]
-#     )
-    
-#     # 矩阵链式乘法优化
-#     B_trans = torch.bmm(B_rot, B_blocks_float)  # [s*n, D, D]
-#     B_trans = B_trans.view(-1, num_blocks, D, D)  # [s, n, D, D]
-    
-#     # 替换einsum为广播乘法（编译更友好）
-#     x_trans = (x.unsqueeze(2).to(x.dtype) @ B_trans.permute(0,1,3,2))
-#     return x_trans.squeeze(2)
-
-# def apply_rotary_pos_emb_compiled(q, k, cos_size_matrix, B_q, B_k):
-#     # 静态形状提取（编译时固定）
-#     batch_size, num_heads_q, seq_len, head_dim = q.shape
-#     _, num_heads_k, _, _ = k.shape
-#     head_dim_half = head_dim // 2
-    
-#     # 预计算B和cos的静态参数
-#     B_q_preprocessed = _preprocess_B(B_q, seq_len, num_heads_q, head_dim_half)
-#     B_k_preprocessed = _preprocess_B(B_k, seq_len, num_heads_k, head_dim_half)
-#     cos_q = _preprocess_cos(cos_size_matrix, num_heads_q, head_dim_half)
-#     cos_k = _preprocess_cos(cos_size_matrix, num_heads_k, head_dim_half)
-
-#     # 合并多头维度（保持连续内存布局）
-#     q_concat = q.permute(0,2,1,3).contiguous().view(batch_size, seq_len, -1)
-#     k_concat = k.permute(0,2,1,3).contiguous().view(batch_size, seq_len, -1)
-
-#     # 执行编译优化的核心变换
-#     q_trans = parallel_transform_compiled(
-#         q_concat, B_q_preprocessed, cos_q, 
-#         num_heads_q * head_dim_half, B_q.shape[-1]
-#     )
-#     k_trans = parallel_transform_compiled(
-#         k_concat, B_k_preprocessed, cos_k,
-#         num_heads_k * head_dim_half, B_k.shape[-1]
-#     )
-
-#     # 输出形状重构
-#     return q_trans.view(batch_size, seq_len, num_heads_q* head_dim), k_trans.view(batch_size, seq_len, num_heads_k* head_dim)
-
-# # 预处理器函数（静态参数计算）
-# def _preprocess_B(B: torch.Tensor, seq_len: int, num_heads: int, head_dim_half: int):
-#     num_blocks = num_heads * head_dim_half
-#     B_blocks = B.view(num_blocks, 2, -1)
-#     B_expanded = B_blocks.unsqueeze(0).expand(seq_len, -1, -1, -1)  # [s, n, 2, D]
-#     return B_expanded.contiguous().view(seq_len * num_blocks, 2, -1)
-
-# def _preprocess_cos(cos: torch.Tensor, num_heads: int, head_dim_half: int):
-#     cos_expanded = cos[:, :head_dim_half].unsqueeze(1)  # [s, 1, 16, 2, 2]
-#     cos_expanded = cos_expanded.expand(-1, num_heads, -1, -1, -1).contiguous()
-#     return cos_expanded.view(cos.size(0), num_heads * head_dim_half, 2, 2).view(-1, 2, 2)
 
 
 class LlamaMLP(nn.Module):
@@ -600,8 +555,6 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         self.init = False
         self.init_B = False
-        # self.B_q = nn.Parameter(torch.zeros(self.head_dim//2*config.num_attention_heads, self.head_dim//2*config.num_attention_heads))
-        # self.B_k = nn.Parameter(torch.zeros(self.head_dim//2*config.num_key_value_heads, self.head_dim//2*config.num_key_value_heads))
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -639,9 +592,10 @@ class LlamaAttention(nn.Module):
 
     def get_up_down_matrix(self):
         """
-        对 q_proj、k_proj 分别用SVD分解，然后把分解后的矩阵拷贝到
-         q_d_proj、q_u_proj，以及 k_d_proj、k_u_proj 上。
+        Perform SVD decomposition on `q_proj` and `k_proj` separately, and then copy the decomposed matrices to
+        `q_d_proj`, `q_u_proj`, as well as `k_d_proj`, `k_u_proj`.
         """
+
         with torch.no_grad():
             W_q = self.q_proj.weight.float()  # [384, 384]
             U_q, S_q, Vh_q = torch.linalg.svd(W_q, full_matrices=False)  # U_q: [384,384], S_q: [384], Vh_q: [384,384]
@@ -693,9 +647,9 @@ class LlamaAttention(nn.Module):
     @staticmethod
     def randomized_svd(A, rank=None, n_iter=5):
         """
-        使用随机 SVD 分解，提高计算速度：
-        - rank: 目标低秩近似的维度（默认为 X.shape[1]）
-        - n_iter: 迭代次数，控制近似精度
+        Perform randomized SVD decomposition to improve computation speed:
+        - rank: The target rank for the low-rank approximation (defaults to X.shape[1])
+        - n_iter: The number of iterations to control the approximation accuracy
         """
         # if not isinstance(X, torch.Tensor):
         #     raise ValueError(f"Expected a tensor, but got {type(X)}")
@@ -703,21 +657,22 @@ class LlamaAttention(nn.Module):
             rank = min(A.shape)  
         Q_init = torch.randn(A.shape[0], rank, device=A.device, dtype=A.dtype)
         Q, _ = torch.linalg.qr(Q_init)  
-        B = Q.T @ A  # 低秩投影
+        B = Q.T @ A  # Low-rank projection
         U, _, V_T = torch.linalg.svd(B.float(), full_matrices=False)
 
-        return V_T.T.to(A.dtype)  # 返回近似的 B 矩阵
+        return V_T.T.to(A.dtype)  # Return the approximate B matrix
+
 
     def get_up_cb_matrix_fast(self):
-        """ 使用 Randomized SVD 替代标准 SVD，提高计算速度 """
+        """ Use Randomized SVD instead of standard SVD to improve computation speed """
         with torch.no_grad():
             W_q = self.q_u_proj.weight.float()
-            B_q = LlamaAttention.randomized_svd(W_q)  # 近似 B 矩阵
+            B_q = LlamaAttention.randomized_svd(W_q)  # Approximate B matrix
             W_k = self.k_u_proj.weight.float()
             B_k = LlamaAttention.randomized_svd(W_k)
 
         return B_q.to(self.q_u_proj.weight.dtype), B_k.to(self.q_u_proj.weight.dtype)
-    
+
 
     def get_up_cb_matrix(self):
         """ input: up_matrix: [32 * config.hidden_size, 64 * config.hidden_size] [32 * 6, 64 * 6]

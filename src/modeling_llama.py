@@ -55,7 +55,7 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 #     from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 
-
+""" The original Llama3 """
 logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
