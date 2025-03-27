@@ -13,9 +13,24 @@
 
 # Language Model Training and Evaluation -->
 ---
+
 ## HLA-RoPE
 
 The model enables the RoPE process on the latent space thus saving the memory in cache.
+
+## 📁 Project Structure
+
+The repository is organized as follows:
+
+```
+MHA2HLA/
+├── .github/         # GitHub-specific files (e.g., workflows, issue templates)
+├── Docs/            # Our mathematical prove and structures of our design
+├── Evaluation/      # Scripts and tools for evaluating model performance
+├── src/             # Core source code ( model definitions; we modified structures of model here)
+├── train/           # Training scripts and experiment configurations
+├── utils/           # Utility functions and helper modules
+```
 
 ## 🏋️‍♂️ Training
 
@@ -27,7 +42,7 @@ We trained models on both:
 
 To start training:
 ```bash
-python fine-tune.py  # Run inside each experiment folder
+python fine_tuning.py  # Run inside each experiment folder
 ```
 
 Google Colab Jupyter Notebooks used for training are available in our Google Drive.
